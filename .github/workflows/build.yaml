@@ -141,9 +141,12 @@ jobs:
           if-no-files-found: error
           path: ${{ runner.temp }}/kenkomqtt-android.apk
 
-  # ---------- iOS 未签名 .ipa（无需任何证书/secrets；不能直接装真机，需事后重签） ----------
+  # ---------- iOS 构建（无签名：模拟器 .app）----------
+  # 说明：Tauri 的 iOS 生产构建必须走 `tauri ios build`（原始 xcodebuild 会进 dev 路径、依赖 dev server）。
+  # 真机 .ipa 的 export 步骤需要签名证书；无 secrets 时只能产出「模拟器 .app」这种免签名产物。
+  # 要 CI 直接出可安装到真机的签名 .ipa，需把证书(.p12)+描述文件放 GitHub Secrets 再签（见 README）。
   ios:
-    name: 构建 iOS (未签名 .ipa)
+    name: 构建 iOS (模拟器·免签名)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -160,10 +163,10 @@ jobs:
           cache: pnpm
           cache-dependency-path: ${{ env.APP_DIR }}/pnpm-lock.yaml
 
-      - name: 安装 Rust (iOS target)
+      - name: 安装 Rust (iOS 模拟器 target)
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-ios
+          targets: aarch64-apple-ios-sim
 
       - name: Rust 缓存
         uses: swatinem/rust-cache@v2
@@ -181,24 +184,22 @@ jobs:
         working-directory: ${{ env.APP_DIR }}
         run: pnpm tauri ios init
 
-      - name: 构建未签名 .app 并打包 .ipa
+      - name: 构建模拟器 .app（免签名）
+        working-directory: ${{ env.APP_DIR }}
+        run: pnpm tauri ios build --target aarch64-sim
+
+      - name: 打包 .app
         working-directory: ${{ env.APP_DIR }}
         run: |
           set -euo pipefail
-          PROJ="$(ls -d src-tauri/gen/apple/*.xcodeproj | head -1)"
-          SCHEME="$(xcodebuild -list -project "$PROJ" 2>/dev/null | awk '/Schemes:/{f=1;next} f&&NF{gsub(/^ +/,"");print;exit}')"
-          echo "project=$PROJ scheme=$SCHEME"
-          xcodebuild -project "$PROJ" -scheme "$SCHEME" -configuration release \
-            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath dd \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
-          APP="$(find dd/Build/Products -maxdepth 2 -name '*.app' -type d | head -1)"
+          APP="$(find src-tauri/gen/apple/build -name '*.app' -type d -path '*sim*' | head -1)"
           echo "app=$APP"
-          rm -rf Payload && mkdir Payload && cp -R "$APP" Payload/
-          zip -qr "$RUNNER_TEMP/KenkoMQTT-ios-unsigned.ipa" Payload
+          test -n "$APP"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$RUNNER_TEMP/KenkoMQTT-iossim.app.zip"
 
       - name: 上传产物
         uses: actions/upload-artifact@v7
         with:
-          name: kenkomqtt-ios-unsigned
+          name: kenkomqtt-ios-simulator
           if-no-files-found: error
-          path: ${{ runner.temp }}/KenkoMQTT-ios-unsigned.ipa
+          path: ${{ runner.temp }}/KenkoMQTT-iossim.app.zip
