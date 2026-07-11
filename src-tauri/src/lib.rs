@@ -1,8 +1,12 @@
+mod android;
+mod broker;
 mod model;
 mod mqtt;
 mod store;
 pub mod tls;
 
+use android::{check_android_permissions, open_android_settings, platform_info};
+use broker::{BrokerConfig, BrokerState};
 use model::Profile;
 use mqtt::Manager;
 use tauri::{AppHandle, State};
@@ -66,10 +70,38 @@ async fn mqtt_publish(
     mqtt::publish(mgr, conn_id, topic, payload, qos, retain).await
 }
 
+// ---- 内嵌 Broker ----
+
+#[tauri::command]
+async fn broker_start(
+    app: AppHandle,
+    state: State<'_, BrokerState>,
+    config: BrokerConfig,
+) -> Result<(), String> {
+    let _ = store::save_broker(&app, &config);
+    broker::start(app.clone(), &state, config).await
+}
+
+#[tauri::command]
+fn broker_stop(app: AppHandle, state: State<'_, BrokerState>) {
+    broker::stop(&app, &state)
+}
+
+#[tauri::command]
+fn broker_status(state: State<'_, BrokerState>) -> bool {
+    broker::is_running(&state)
+}
+
+#[tauri::command]
+fn broker_get_config(app: AppHandle, state: State<'_, BrokerState>) -> BrokerConfig {
+    broker::current_config(&state).unwrap_or_else(|| store::load_broker(&app))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(Manager::default())
+        .manage(BrokerState::default())
         .invoke_handler(tauri::generate_handler![
             list_profiles,
             save_profile,
@@ -78,7 +110,14 @@ pub fn run() {
             mqtt_disconnect,
             mqtt_subscribe,
             mqtt_unsubscribe,
-            mqtt_publish
+            mqtt_publish,
+            broker_start,
+            broker_stop,
+            broker_status,
+            broker_get_config,
+            platform_info,
+            check_android_permissions,
+            open_android_settings
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

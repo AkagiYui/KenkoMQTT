@@ -90,3 +90,66 @@ export function newProfile(): Profile {
 }
 
 export const DEFAULT_PORTS: Record<Protocol, number> = { tcp: 1883, tls: 8883, ws: 8083, wss: 8084 }
+
+// ---- Broker ----
+export interface BrokerConfig {
+  host: string
+  port: number
+  allowAnonymous: boolean
+  username: string
+  password: string
+  maxClients: number
+}
+export interface BrokerClientRow {
+  clientId: string
+  addr: string
+  username: string
+  subs: number
+}
+export interface BrokerEvt {
+  kind: "connect" | "disconnect" | "subscribe" | "unsubscribe" | "publish"
+  clientId: string
+  topic?: string
+  payload?: string
+  ts: number
+}
+export interface BrokerStats {
+  running: boolean
+  clientsConnected: number
+  msgsReceived: number
+  msgsSent: number
+  retained: number
+}
+
+export const brokerStart = (config: BrokerConfig) => invoke<void>("broker_start", { config })
+export const brokerStop = () => invoke<void>("broker_stop")
+export const brokerStatus = () => invoke<boolean>("broker_status")
+export const brokerGetConfig = () => invoke<BrokerConfig>("broker_get_config")
+
+export const onBrokerStats = (cb: (s: BrokerStats) => void) =>
+  listen<BrokerStats>("broker:stats", (e) => cb(e.payload))
+export const onBrokerClients = (cb: (c: BrokerClientRow[]) => void) =>
+  listen<BrokerClientRow[]>("broker:clients", (e) => cb(e.payload))
+export const onBrokerEvent = (cb: (ev: BrokerEvt) => void) =>
+  listen<BrokerEvt>("broker:event", (e) => cb(e.payload))
+export const onBrokerStatus = (cb: (running: boolean) => void) =>
+  listen<{ running: boolean }>("broker:status", (e) => cb(e.payload.running))
+
+export function newBrokerConfig(): BrokerConfig {
+  return { host: "0.0.0.0", port: 1883, allowAnonymous: true, username: "", password: "", maxClients: 0 }
+}
+
+// ---- 平台 / Android 权限 ----
+export interface PlatformInfo {
+  os: string
+  isAndroid: boolean
+}
+export interface AndroidPerms {
+  applicable: boolean
+  known: boolean
+  ignoringBatteryOptimizations: boolean
+}
+export const platformInfo = () => invoke<PlatformInfo>("platform_info")
+export const checkAndroidPermissions = () => invoke<AndroidPerms>("check_android_permissions")
+export const openAndroidSettings = (kind: "battery" | "appdetails") =>
+  invoke<void>("open_android_settings", { kind })

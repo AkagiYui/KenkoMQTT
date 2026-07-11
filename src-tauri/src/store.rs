@@ -25,3 +25,23 @@ pub fn save_all(app: &AppHandle, profiles: &[Profile]) -> Result<(), String> {
     let data = serde_json::to_vec_pretty(profiles).map_err(|e| e.to_string())?;
     std::fs::write(&p, data).map_err(|e| e.to_string())
 }
+
+fn broker_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("broker.json"))
+}
+
+pub fn load_broker(app: &AppHandle) -> crate::broker::BrokerConfig {
+    let read = || -> Option<crate::broker::BrokerConfig> {
+        let p = broker_path(app).ok()?;
+        serde_json::from_slice(&std::fs::read(&p).ok()?).ok()
+    };
+    read().unwrap_or_default()
+}
+
+pub fn save_broker(app: &AppHandle, cfg: &crate::broker::BrokerConfig) -> Result<(), String> {
+    let p = broker_path(app)?;
+    let data = serde_json::to_vec_pretty(cfg).map_err(|e| e.to_string())?;
+    std::fs::write(&p, data).map_err(|e| e.to_string())
+}
