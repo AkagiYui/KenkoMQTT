@@ -27,6 +27,11 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # main.go 通过 //go:embed all:frontend/dist 嵌入前端产物；测试阶段不构建前端，
+      # 因此放置一个占位文件以满足 embed，避免 "no matching files found"。
+      - name: 准备 embed 占位
+        run: mkdir -p frontend/dist && echo "placeholder" > frontend/dist/index.html
+
       - name: go vet
         run: go vet ./internal/... .
 
