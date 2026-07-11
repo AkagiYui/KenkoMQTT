@@ -16,8 +16,10 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# PoC 只验证明文 TCP，关掉默认的 rustls 以加快编译、简化 Android 构建（TLS 后续再加）。
-rumqttc = { version = "0.24", default-features = false }
+# use-rustls: tls:// 与 wss:// ；websocket: ws:// / wss://。v5 模块随 crate 提供。
+rumqttc = { version = "0.24", default-features = false, features = ["use-rustls", "websocket"] }
+# 用于 tls skip-verify 的 dangerous 校验器；必须与 rumqttc 依赖的 rustls 版本一致（0.22）。
+rustls = "0.22"
 
 [features]
 # used by `tauri dev`/`tauri build` to skip the updater etc.

@@ -1,11 +1,18 @@
 import { defineConfig } from "vite"
 import react from "@vitejs/plugin-react"
+import tailwindcss from "@tailwindcss/vite"
+import path from "node:path"
 
 // Tauri 期望固定端口；移动端 dev 需监听 0.0.0.0 让设备/模拟器可访问。
 const host = process.env.TAURI_DEV_HOST
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
+  resolve: {
+    alias: {
+      "@": path.resolve(__dirname, "src"),
+    },
+  },
   clearScreen: false,
   server: {
     port: 1420,
