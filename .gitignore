@@ -1,17 +1,11 @@
-.task
-bin
-frontend/dist
-frontend/node_modules
-build/linux/appimage/build
-build/windows/nsis/MicrosoftEdgeWebview2Setup.exe
-# Mobile generated
-build/ios/xcode/overlay.json
-build/ios/xcode/gen/
-build/android/overlay.json
-build/android/gen/
-.DS_Store
-# Reference projects (not part of the app)
-tmp/
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
 
-# 本地编译产物（go build .）
-/kenkomqtt
+# 参考项目（本地对照用，不纳入版本库）
+/tmp/
+
+# 本地产物 / 工具缓存
+/bin/
+.task/

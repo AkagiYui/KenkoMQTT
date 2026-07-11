@@ -6,9 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Tauri 客户端位于 tauri-poc/ 子目录。
+# Tauri 应用位于仓库根目录。
 env:
-  APP_DIR: tauri-poc
+  APP_DIR: .
 
 jobs:
   # ---------- 桌面端：Windows / macOS 生产包 ----------
