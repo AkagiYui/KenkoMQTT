@@ -1,0 +1,24 @@
+[package]
+name = "kenkomqtt-poc"
+version = "0.1.0"
+description = "KenkoMQTT Tauri Android PoC"
+edition = "2021"
+
+[lib]
+# staticlib/cdylib are required for the mobile (Android/iOS) targets.
+name = "kenkomqtt_poc_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# PoC 只验证明文 TCP，关掉默认的 rustls 以加快编译、简化 Android 构建（TLS 后续再加）。
+rumqttc = { version = "0.24", default-features = false }
+
+[features]
+# used by `tauri dev`/`tauri build` to skip the updater etc.
+default = []
