@@ -16,7 +16,9 @@ concurrency:
 jobs:
   test:
     name: 后端测试 (Go)
-    runs-on: ubuntu-latest
+    # 在 macOS 上运行：内嵌 Wails 的 application 包依赖平台 GUI 库，
+    # Linux 需额外 GTK4/WebKit 系统依赖，macOS 自带 SDK，最简单可靠。
+    runs-on: macos-latest
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
