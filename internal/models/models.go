@@ -26,6 +26,26 @@ type Connection struct {
 	UpdatedAt    time.Time `json:"updatedAt"`
 }
 
+// ConnectionInput 是保存连接档案时前端提交的入参。
+// 刻意不含 CreatedAt/UpdatedAt —— 时间戳由后端管理，前端无需（也不应）传递，
+// 从而避免把空字符串反序列化为 time.Time 时的解析错误。
+type ConnectionInput struct {
+	ID            string `json:"id"` // 为空表示新建
+	Name          string `json:"name"`
+	Protocol      string `json:"protocol"`
+	Host          string `json:"host"`
+	Port          int    `json:"port"`
+	Path          string `json:"path"`
+	ClientID      string `json:"clientId"`
+	Username      string `json:"username"`
+	Password      string `json:"password"`
+	KeepAlive     int    `json:"keepAlive"`
+	CleanSession  bool   `json:"cleanSession"`
+	MQTTVersion   int    `json:"mqttVersion"`
+	TLSSkipVerify bool   `json:"tlsSkipVerify"`
+	SortOrder     int    `json:"sortOrder"`
+}
+
 // Settings 通用键值设置表。
 type Settings struct {
 	Key   string `gorm:"primaryKey" json:"key"`

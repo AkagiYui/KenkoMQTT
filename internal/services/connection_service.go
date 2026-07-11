@@ -39,32 +39,67 @@ func (s *ConnectionService) GetConnection(id string) (*models.Connection, error)
 }
 
 // SaveConnection 创建或更新连接档案。ID 为空时创建新记录并返回。
-func (s *ConnectionService) SaveConnection(conn models.Connection) (*models.Connection, error) {
-	if conn.Protocol == "" {
-		conn.Protocol = "tcp"
+// 时间戳完全由后端维护：新建时写入 CreatedAt/UpdatedAt，更新时保留原 CreatedAt、刷新 UpdatedAt。
+func (s *ConnectionService) SaveConnection(input models.ConnectionInput) (*models.Connection, error) {
+	if input.Protocol == "" {
+		input.Protocol = "tcp"
 	}
-	if conn.Port == 0 {
-		conn.Port = 1883
+	if input.Port == 0 {
+		input.Port = 1883
 	}
-	if conn.KeepAlive == 0 {
-		conn.KeepAlive = 60
+	if input.KeepAlive == 0 {
+		input.KeepAlive = 60
 	}
-	if conn.MQTTVersion == 0 {
-		conn.MQTTVersion = 4
+	if input.MQTTVersion == 0 {
+		input.MQTTVersion = 4
 	}
 
-	if conn.ID == "" {
-		conn.ID = uuid.NewString()
-		conn.CreatedAt = time.Now()
-		conn.UpdatedAt = conn.CreatedAt
+	now := time.Now()
+
+	if input.ID == "" {
+		conn := models.Connection{
+			ID:            uuid.NewString(),
+			Name:          input.Name,
+			Protocol:      input.Protocol,
+			Host:          input.Host,
+			Port:          input.Port,
+			Path:          input.Path,
+			ClientID:      input.ClientID,
+			Username:      input.Username,
+			Password:      input.Password,
+			KeepAlive:     input.KeepAlive,
+			CleanSession:  input.CleanSession,
+			MQTTVersion:   input.MQTTVersion,
+			TLSSkipVerify: input.TLSSkipVerify,
+			SortOrder:     input.SortOrder,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}
 		if err := s.db.Create(&conn).Error; err != nil {
 			return nil, fmt.Errorf("创建连接档案失败: %w", err)
 		}
 		return &conn, nil
 	}
 
-	conn.UpdatedAt = time.Now()
-	if err := s.db.Model(&models.Connection{}).Where("id = ?", conn.ID).Save(&conn).Error; err != nil {
+	var conn models.Connection
+	if err := s.db.Where("id = ?", input.ID).First(&conn).Error; err != nil {
+		return nil, fmt.Errorf("待更新的连接档案不存在: %w", err)
+	}
+	conn.Name = input.Name
+	conn.Protocol = input.Protocol
+	conn.Host = input.Host
+	conn.Port = input.Port
+	conn.Path = input.Path
+	conn.ClientID = input.ClientID
+	conn.Username = input.Username
+	conn.Password = input.Password
+	conn.KeepAlive = input.KeepAlive
+	conn.CleanSession = input.CleanSession
+	conn.MQTTVersion = input.MQTTVersion
+	conn.TLSSkipVerify = input.TLSSkipVerify
+	conn.SortOrder = input.SortOrder
+	conn.UpdatedAt = now
+	if err := s.db.Save(&conn).Error; err != nil {
 		return nil, fmt.Errorf("更新连接档案失败: %w", err)
 	}
 	return &conn, nil

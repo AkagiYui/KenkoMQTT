@@ -37,7 +37,8 @@ export function ListConnections(): $CancellablePromise<models$0.Connection[] | n
 
 /**
  * SaveConnection 创建或更新连接档案。ID 为空时创建新记录并返回。
+ * 时间戳完全由后端维护：新建时写入 CreatedAt/UpdatedAt，更新时保留原 CreatedAt、刷新 UpdatedAt。
  */
-export function SaveConnection(conn: models$0.Connection): $CancellablePromise<models$0.Connection | null> {
-    return $Call.ByID(4241284660, conn);
+export function SaveConnection(input: models$0.ConnectionInput): $CancellablePromise<models$0.Connection | null> {
+    return $Call.ByID(4241284660, input);
 }

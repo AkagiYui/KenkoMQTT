@@ -46,3 +46,28 @@ export interface Connection {
     "createdAt": time$0.Time;
     "updatedAt": time$0.Time;
 }
+
+/**
+ * ConnectionInput 是保存连接档案时前端提交的入参。
+ * 刻意不含 CreatedAt/UpdatedAt —— 时间戳由后端管理，前端无需（也不应）传递，
+ * 从而避免把空字符串反序列化为 time.Time 时的解析错误。
+ */
+export interface ConnectionInput {
+    /**
+     * 为空表示新建
+     */
+    "id": string;
+    "name": string;
+    "protocol": string;
+    "host": string;
+    "port": number;
+    "path": string;
+    "clientId": string;
+    "username": string;
+    "password": string;
+    "keepAlive": number;
+    "cleanSession": boolean;
+    "mqttVersion": number;
+    "tlsSkipVerify": boolean;
+    "sortOrder": number;
+}

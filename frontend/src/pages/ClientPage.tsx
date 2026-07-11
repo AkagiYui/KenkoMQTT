@@ -3,7 +3,7 @@ import { Plus, Plug, Unplug, Trash2, Send, ArrowDown, ArrowUp, Save } from "luci
 import { toast } from "sonner"
 import { ClientService, ConnectionService } from "@bindings/kenkomqtt/internal/services"
 import type { ClientMessage, ClientStatusEvent, ClientConnectOptions } from "@bindings/kenkomqtt/internal/services"
-import type { Connection } from "@bindings/kenkomqtt/internal/models"
+import type { Connection, ConnectionInput } from "@bindings/kenkomqtt/internal/models"
 import { EV, onEvent } from "@/lib/events"
 import { cn, formatTime, tryPrettyJSON } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -137,7 +137,24 @@ export function ClientPage() {
 
   async function handleSave(): Promise<Connection | null> {
     try {
-      const saved = await ConnectionService.SaveConnection(form)
+      // 只提交可编辑字段；createdAt/updatedAt 由后端维护，不从前端传递。
+      const input: ConnectionInput = {
+        id: form.id,
+        name: form.name,
+        protocol: form.protocol,
+        host: form.host,
+        port: form.port,
+        path: form.path,
+        clientId: form.clientId,
+        username: form.username,
+        password: form.password,
+        keepAlive: form.keepAlive,
+        cleanSession: form.cleanSession,
+        mqttVersion: form.mqttVersion,
+        tlsSkipVerify: form.tlsSkipVerify,
+        sortOrder: form.sortOrder,
+      }
+      const saved = await ConnectionService.SaveConnection(input)
       if (saved) {
         setForm(saved)
         setIsDraft(false)
