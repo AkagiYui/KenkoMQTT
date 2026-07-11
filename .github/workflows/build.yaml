@@ -1,103 +1,142 @@
-name: Build
+name: 构建
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
+    branches: [main]
   pull_request:
+  workflow_dispatch:
 
-# 同一分支上的旧构建在有新推送时自动取消
-concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: true
+# Tauri 客户端位于 tauri-poc/ 子目录。
+env:
+  APP_DIR: tauri-poc
 
 jobs:
-  test:
-    name: 后端测试 (Go)
-    # 在 macOS 上运行：内嵌 Wails 的 application 包依赖平台 GUI 库，
-    # Linux 需额外 GTK4/WebKit 系统依赖，macOS 自带 SDK，最简单可靠。
-    runs-on: macos-latest
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 安装 Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      # main.go 通过 //go:embed all:frontend/dist 嵌入前端产物；测试阶段不构建前端，
-      # 因此放置一个占位文件以满足 embed，避免 "no matching files found"。
-      - name: 准备 embed 占位
-        run: mkdir -p frontend/dist && echo "placeholder" > frontend/dist/index.html
-
-      - name: go vet
-        run: go vet ./internal/... .
-
-      - name: 运行测试
-        run: go test ./internal/... -count=1
-
-  build:
-    name: 构建 ${{ matrix.os }} (${{ matrix.arch }})
-    needs: test
+  # ---------- 桌面端：Windows / macOS 生产包 ----------
+  desktop:
+    name: 构建桌面 (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: macos-latest
-            arch: arm64
-            artifact: KenkoMQTT-macos-arm64
+            rust_target: aarch64-apple-darwin
+            artifact: kenkomqtt-macos
           - os: windows-latest
-            arch: amd64
-            artifact: KenkoMQTT-windows-amd64
+            rust_target: x86_64-pc-windows-msvc
+            artifact: kenkomqtt-windows
     runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        shell: bash
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 安装 Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
+      - uses: actions/checkout@v4
 
       - name: 安装 pnpm
         uses: pnpm/action-setup@v4
         with:
           version: 10
-          package_json_file: frontend/package.json
 
-      - name: 安装 Node.js
+      - name: 安装 Node
         uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm
-          cache-dependency-path: frontend/pnpm-lock.yaml
+          cache-dependency-path: ${{ env.APP_DIR }}/pnpm-lock.yaml
 
-      - name: 安装 NSIS (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          choco install nsis --version=3.10 --no-progress -y
-          echo "C:\Program Files (x86)\NSIS" >> "${GITHUB_PATH}"
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
 
-      - name: 安装 Wails3 CLI
-        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha2.111
+      - name: Rust 缓存
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.APP_DIR }}/src-tauri -> target
 
-      - name: 更新构建资源
-        run: wails3 task common:update:build-assets
+      - name: 安装前端依赖
+        working-directory: ${{ env.APP_DIR }}
+        run: pnpm install
 
-      - name: 打包应用
-        run: wails3 package
+      - name: 构建 Tauri 生产包
+        working-directory: ${{ env.APP_DIR }}
+        run: pnpm tauri build --target ${{ matrix.rust_target }}
 
-      - name: 上传构建产物
+      - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: bin/
           if-no-files-found: error
+          path: |
+            ${{ env.APP_DIR }}/src-tauri/target/${{ matrix.rust_target }}/release/bundle/dmg/*.dmg
+            ${{ env.APP_DIR }}/src-tauri/target/${{ matrix.rust_target }}/release/bundle/macos/*.app
+            ${{ env.APP_DIR }}/src-tauri/target/${{ matrix.rust_target }}/release/bundle/msi/*.msi
+            ${{ env.APP_DIR }}/src-tauri/target/${{ matrix.rust_target }}/release/bundle/nsis/*.exe
+
+  # ---------- Android 生产 APK ----------
+  android:
+    name: 构建 Android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ${{ env.APP_DIR }}/pnpm-lock.yaml
+
+      - name: 安装 Rust (Android targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Rust 缓存
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.APP_DIR }}/src-tauri -> target
+
+      - name: 配置 Android NDK 环境
+        run: echo "NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+
+      - name: 安装前端依赖
+        working-directory: ${{ env.APP_DIR }}
+        run: pnpm install
+
+      - name: 初始化 Android 工程
+        working-directory: ${{ env.APP_DIR }}
+        run: pnpm tauri android init
+
+      - name: 构建 Android 生产 APK
+        working-directory: ${{ env.APP_DIR }}
+        run: pnpm tauri android build --apk
+
+      - name: 生成签名密钥并签名 APK
+        run: |
+          set -e
+          KS="$RUNNER_TEMP/ci.jks"
+          keytool -genkeypair -v -keystore "$KS" -alias ci -keyalg RSA -keysize 2048 \
+            -validity 3650 -storepass android -keypass android \
+            -dname "CN=KenkoMQTT CI, O=KenkoMQTT"
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          UNSIGNED="$(find "$APP_DIR/src-tauri/gen/android" -path '*release*' -name '*-unsigned.apk' | head -1)"
+          echo "unsigned apk: $UNSIGNED"
+          test -n "$UNSIGNED"
+          "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --ks-key-alias ci \
+            --key-pass pass:android --out "$RUNNER_TEMP/kenkomqtt-android.apk" "$UNSIGNED"
+          "$BT/apksigner" verify "$RUNNER_TEMP/kenkomqtt-android.apk"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: kenkomqtt-android
+          if-no-files-found: error
+          path: ${{ runner.temp }}/kenkomqtt-android.apk
