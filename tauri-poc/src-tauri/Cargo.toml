@@ -18,8 +18,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # use-rustls: tls:// 与 wss:// ；websocket: ws:// / wss://。v5 模块随 crate 提供。
 rumqttc = { version = "0.24", default-features = false, features = ["use-rustls", "websocket"] }
-# 用于 tls skip-verify 的 dangerous 校验器；必须与 rumqttc 依赖的 rustls 版本一致（0.22）。
+# 用于 tls 的 rustls 配置（skip-verify / CA / 系统根）；版本须与 rumqttc 的 rustls 一致（0.22）。
 rustls = "0.22"
+rustls-pemfile = "2"
+webpki-roots = "0.26"
 
 [features]
 # used by `tauri dev`/`tauri build` to skip the updater etc.

@@ -1,6 +1,7 @@
 mod model;
 mod mqtt;
 mod store;
+pub mod tls;
 
 use model::Profile;
 use mqtt::Manager;

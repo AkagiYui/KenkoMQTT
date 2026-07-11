@@ -1,5 +1,5 @@
 //! 多连接 MQTT 管理器：支持 MQTT 3.1.1(v4) 与 5.0(v5)，遗嘱，按 connId 管理多条连接。
-//! 传输：TCP（本增量）。TLS / WebSocket 在后续增量加入。
+//! 传输：TCP / TLS / WebSocket / WSS。
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -122,6 +122,38 @@ impl Manager {
     }
 }
 
+fn norm_path(path: &str) -> String {
+    if path.trim().is_empty() {
+        "/mqtt".into()
+    } else if path.starts_with('/') {
+        path.into()
+    } else {
+        format!("/{path}")
+    }
+}
+
+/// 依协议返回 (连接地址, 端口, Transport)。ws/wss 的地址是完整 URL。
+fn transport_for(p: &Profile) -> Result<(String, u16, rumqttc::Transport), String> {
+    use rumqttc::{TlsConfiguration, Transport};
+    match p.protocol.as_str() {
+        "tcp" => Ok((p.host.clone(), p.port, Transport::Tcp)),
+        "tls" => {
+            let cfg = crate::tls::client_config(p.tls_skip_verify, &p.ca_cert);
+            Ok((p.host.clone(), p.port, Transport::Tls(TlsConfiguration::Rustls(cfg))))
+        }
+        "ws" => Ok((format!("ws://{}:{}{}", p.host, p.port, norm_path(&p.path)), p.port, Transport::Ws)),
+        "wss" => {
+            let cfg = crate::tls::client_config(p.tls_skip_verify, &p.ca_cert);
+            Ok((
+                format!("wss://{}:{}{}", p.host, p.port, norm_path(&p.path)),
+                p.port,
+                Transport::Wss(TlsConfiguration::Rustls(cfg)),
+            ))
+        }
+        other => Err(format!("未知协议: {other}")),
+    }
+}
+
 /// 建立连接。已存在同 id 连接会先被拆除。
 pub fn connect(app: AppHandle, mgr: &Manager, profile: Profile) -> Result<(), String> {
     // 拆掉旧连接
@@ -138,22 +170,30 @@ pub fn connect(app: AppHandle, mgr: &Manager, profile: Profile) -> Result<(), St
         profile.client_id.clone()
     };
 
-    match profile.protocol.as_str() {
-        "tcp" => {}
-        other => return Err(format!("暂不支持的协议(本增量仅 tcp)：{other}")),
-    }
+    let (addr, port, transport) = transport_for(&profile)?;
 
     if profile.mqtt_version == 5 {
-        connect_v5(app, mgr, &conn_id, &client_id, &profile)
+        connect_v5(app, mgr, &conn_id, &client_id, &profile, addr, port, transport)
     } else {
-        connect_v4(app, mgr, &conn_id, &client_id, &profile)
+        connect_v4(app, mgr, &conn_id, &client_id, &profile, addr, port, transport)
     }
 }
 
-fn connect_v4(app: AppHandle, mgr: &Manager, conn_id: &str, client_id: &str, p: &Profile) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+fn connect_v4(
+    app: AppHandle,
+    mgr: &Manager,
+    conn_id: &str,
+    client_id: &str,
+    p: &Profile,
+    addr: String,
+    port: u16,
+    transport: rumqttc::Transport,
+) -> Result<(), String> {
     use rumqttc::{AsyncClient, Event, MqttOptions, Packet};
 
-    let mut opts = MqttOptions::new(client_id, &p.host, p.port);
+    let mut opts = MqttOptions::new(client_id, addr, port);
+    opts.set_transport(transport);
     opts.set_keep_alive(Duration::from_secs(p.keep_alive.max(5)));
     opts.set_clean_session(p.clean_session);
     if !p.username.is_empty() {
@@ -196,11 +236,22 @@ fn connect_v4(app: AppHandle, mgr: &Manager, conn_id: &str, client_id: &str, p: 
     Ok(())
 }
 
-fn connect_v5(app: AppHandle, mgr: &Manager, conn_id: &str, client_id: &str, p: &Profile) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+fn connect_v5(
+    app: AppHandle,
+    mgr: &Manager,
+    conn_id: &str,
+    client_id: &str,
+    p: &Profile,
+    addr: String,
+    port: u16,
+    transport: rumqttc::Transport,
+) -> Result<(), String> {
     use rumqttc::v5::mqttbytes::v5::Packet;
     use rumqttc::v5::{AsyncClient, Event, MqttOptions};
 
-    let mut opts = MqttOptions::new(client_id, &p.host, p.port);
+    let mut opts = MqttOptions::new(client_id, addr, port);
+    opts.set_transport(transport);
     opts.set_keep_alive(Duration::from_secs(p.keep_alive.max(5)));
     opts.set_clean_start(p.clean_session);
     if !p.username.is_empty() {
