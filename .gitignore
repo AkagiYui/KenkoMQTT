@@ -1,0 +1,14 @@
+.task
+bin
+frontend/dist
+frontend/node_modules
+build/linux/appimage/build
+build/windows/nsis/MicrosoftEdgeWebview2Setup.exe
+# Mobile generated
+build/ios/xcode/overlay.json
+build/ios/xcode/gen/
+build/android/overlay.json
+build/android/gen/
+.DS_Store
+# Reference projects (not part of the app)
+tmp/

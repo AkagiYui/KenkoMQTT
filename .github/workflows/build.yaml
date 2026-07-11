@@ -1,0 +1,96 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+# 同一分支上的旧构建在有新推送时自动取消
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: 后端测试 (Go)
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./internal/... .
+
+      - name: 运行测试
+        run: go test ./internal/... -count=1
+
+  build:
+    name: 构建 ${{ matrix.os }} (${{ matrix.arch }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            arch: arm64
+            artifact: KenkoMQTT-macos-arm64
+          - os: windows-latest
+            arch: amd64
+            artifact: KenkoMQTT-windows-amd64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+          package_json_file: frontend/package.json
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: 安装 NSIS (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install nsis --version=3.10 --no-progress -y
+          echo "C:\Program Files (x86)\NSIS" >> "${GITHUB_PATH}"
+
+      - name: 安装 Wails3 CLI
+        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha2.111
+
+      - name: 更新构建资源
+        run: wails3 task common:update:build-assets
+
+      - name: 打包应用
+        run: wails3 package
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: bin/
+          if-no-files-found: error
