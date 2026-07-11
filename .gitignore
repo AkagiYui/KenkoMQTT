@@ -12,3 +12,6 @@ build/android/gen/
 .DS_Store
 # Reference projects (not part of the app)
 tmp/
+
+# 本地编译产物（go build .）
+/kenkomqtt
