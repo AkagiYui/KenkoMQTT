@@ -126,6 +126,30 @@ struct Counters {
 struct Running {
     shutdown: watch::Sender<bool>,
     config: BrokerConfig,
+    core: Arc<Mutex<Core>>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RetainedRow {
+    pub topic: String,
+    pub payload: String,
+    pub qos: u8,
+}
+
+/// 读取当前保留消息（供 UI 的保留消息检查器）。
+pub fn retained(state: &BrokerState) -> Vec<RetainedRow> {
+    let g = state.running.lock().unwrap();
+    let Some(r) = g.as_ref() else { return vec![] };
+    let core = r.core.lock().unwrap();
+    core.retained
+        .values()
+        .map(|p| RetainedRow {
+            topic: p.topic.clone(),
+            payload: String::from_utf8_lossy(&p.payload).to_string(),
+            qos: p.qos as u8,
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -250,7 +274,7 @@ pub async fn start(app: AppHandle, state: &BrokerState, config: BrokerConfig) ->
         });
     }
 
-    *state.running.lock().unwrap() = Some(Running { shutdown: sd_tx, config });
+    *state.running.lock().unwrap() = Some(Running { shutdown: sd_tx, config, core });
     emit(&Some(app), "broker:status", serde_json::json!({"running": true}));
     Ok(())
 }

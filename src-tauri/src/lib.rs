@@ -1,5 +1,6 @@
 mod android;
 mod broker;
+mod codec;
 mod model;
 mod mqtt;
 mod store;
@@ -58,16 +59,73 @@ async fn mqtt_unsubscribe(mgr: State<'_, Manager>, conn_id: String, topic: Strin
     mqtt::unsubscribe(mgr, conn_id, topic).await
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn mqtt_publish(
+    app: AppHandle,
     mgr: State<'_, Manager>,
     conn_id: String,
     topic: String,
     payload: String,
     qos: u8,
     retain: bool,
+    format: Option<codec::Format>,
+    expand: Option<bool>,
 ) -> Result<(), String> {
-    mqtt::publish(mgr, conn_id, topic, payload, qos, retain).await
+    mqtt::publish(app, mgr, conn_id, topic, payload, qos, retain, format, expand).await
+}
+
+// ---- 消息库 / 计算（后端） ----
+
+#[tauri::command]
+fn messages_query(mgr: State<'_, Manager>, conn_id: String, format: codec::Format, filter: Option<String>, limit: Option<usize>) -> Vec<mqtt::MsgRow> {
+    mgr.query(&conn_id, format, filter, limit.unwrap_or(500))
+}
+
+#[tauri::command]
+fn messages_clear(mgr: State<'_, Manager>, conn_id: String) {
+    mgr.clear_msgs(&conn_id)
+}
+
+#[tauri::command]
+fn topic_tree(mgr: State<'_, Manager>, conn_id: String) -> Vec<mqtt::TreeNode> {
+    mgr.topic_tree(&conn_id)
+}
+
+#[tauri::command]
+fn chart_rate(mgr: State<'_, Manager>, conn_id: String, bucket_ms: u64, buckets: usize) -> Vec<mqtt::RatePoint> {
+    mgr.chart_rate(&conn_id, bucket_ms, buckets)
+}
+
+#[tauri::command]
+fn chart_content(mgr: State<'_, Manager>, conn_id: String, topic_filter: String, jsonpath: String, limit: Option<usize>) -> Result<Vec<mqtt::ContentPoint>, String> {
+    mgr.chart_content(&conn_id, topic_filter, jsonpath, limit.unwrap_or(200))
+}
+
+#[tauri::command]
+fn export_messages(mgr: State<'_, Manager>, conn_id: String, csv: bool, format: codec::Format) -> String {
+    mgr.export_messages(&conn_id, csv, format)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+fn schedule_start(
+    app: AppHandle,
+    mgr: State<'_, Manager>,
+    conn_id: String,
+    topic: String,
+    payload: String,
+    qos: u8,
+    retain: bool,
+    format: Option<codec::Format>,
+    interval_ms: u64,
+) -> Result<String, String> {
+    mqtt::schedule_start(app, mgr, conn_id, topic, payload, qos, retain, format, interval_ms)
+}
+
+#[tauri::command]
+fn schedule_stop(mgr: State<'_, Manager>, id: String) {
+    mqtt::schedule_stop(mgr, id)
 }
 
 // ---- 内嵌 Broker ----
@@ -97,6 +155,11 @@ fn broker_get_config(app: AppHandle, state: State<'_, BrokerState>) -> BrokerCon
     broker::current_config(&state).unwrap_or_else(|| store::load_broker(&app))
 }
 
+#[tauri::command]
+fn broker_retained(state: State<'_, BrokerState>) -> Vec<broker::RetainedRow> {
+    broker::retained(&state)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -111,10 +174,19 @@ pub fn run() {
             mqtt_subscribe,
             mqtt_unsubscribe,
             mqtt_publish,
+            messages_query,
+            messages_clear,
+            topic_tree,
+            chart_rate,
+            chart_content,
+            export_messages,
+            schedule_start,
+            schedule_stop,
             broker_start,
             broker_stop,
             broker_status,
             broker_get_config,
+            broker_retained,
             platform_info,
             check_android_permissions,
             open_android_settings

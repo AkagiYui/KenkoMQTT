@@ -31,11 +31,16 @@ export interface Profile {
   will: Will
 }
 
-export interface MsgEvent {
-  connId: string
+// 载荷格式（后端 codec）
+export type Format = "plaintext" | "json" | "hex" | "base64" | "msgpack" | "cbor"
+export const FORMATS: Format[] = ["plaintext", "json", "hex", "base64", "msgpack", "cbor"]
+
+// 后端消息库返回的行（已按格式解码 + 过滤）
+export interface MsgRow {
   dir: "rx" | "tx"
   topic: string
   payload: string
+  size: number
   qos: number
   retain: boolean
   ts: number
@@ -47,24 +52,69 @@ export interface StatusEvent {
   detail?: string
 }
 
+export interface TreeNode {
+  name: string
+  full: string
+  count: number
+  children: TreeNode[]
+}
+export interface RatePoint {
+  t: number
+  v: number
+}
+export interface ContentPoint {
+  t: number
+  v: number
+}
+
 // ---- 连接档案 ----
 export const listProfiles = () => invoke<Profile[]>("list_profiles")
 export const saveProfile = (profile: Profile) => invoke<Profile>("save_profile", { profile })
 export const deleteProfile = (id: string) => invoke<void>("delete_profile", { id })
 
-// ---- MQTT ----
+// ---- MQTT 连接/订阅/发布 ----
 export const mqttConnect = (profile: Profile) => invoke<void>("mqtt_connect", { profile })
 export const mqttDisconnect = (connId: string) => invoke<void>("mqtt_disconnect", { connId })
 export const mqttSubscribe = (connId: string, topic: string, qos: number) =>
   invoke<void>("mqtt_subscribe", { connId, topic, qos })
 export const mqttUnsubscribe = (connId: string, topic: string) =>
   invoke<void>("mqtt_unsubscribe", { connId, topic })
-export const mqttPublish = (connId: string, topic: string, payload: string, qos: number, retain: boolean) =>
-  invoke<void>("mqtt_publish", { connId, topic, payload, qos, retain })
+export const mqttPublish = (
+  connId: string,
+  topic: string,
+  payload: string,
+  qos: number,
+  retain: boolean,
+  format: Format = "plaintext",
+  expand = false
+) => invoke<void>("mqtt_publish", { connId, topic, payload, qos, retain, format, expand })
+
+// ---- 消息库 / 计算（后端负责，前端仅展示） ----
+export const messagesQuery = (connId: string, format: Format, filter: string, limit = 500) =>
+  invoke<MsgRow[]>("messages_query", { connId, format, filter: filter || null, limit })
+export const messagesClear = (connId: string) => invoke<void>("messages_clear", { connId })
+export const topicTree = (connId: string) => invoke<TreeNode[]>("topic_tree", { connId })
+export const chartRate = (connId: string, bucketMs: number, buckets: number) =>
+  invoke<RatePoint[]>("chart_rate", { connId, bucketMs, buckets })
+export const chartContent = (connId: string, topicFilter: string, jsonpath: string, limit = 200) =>
+  invoke<ContentPoint[]>("chart_content", { connId, topicFilter, jsonpath, limit })
+export const exportMessages = (connId: string, csv: boolean, format: Format) =>
+  invoke<string>("export_messages", { connId, csv, format })
+export const scheduleStart = (
+  connId: string,
+  topic: string,
+  payload: string,
+  qos: number,
+  retain: boolean,
+  format: Format,
+  intervalMs: number
+) => invoke<string>("schedule_start", { connId, topic, payload, qos, retain, format, intervalMs })
+export const scheduleStop = (id: string) => invoke<void>("schedule_stop", { id })
 
 // ---- 事件 ----
-export const onMessage = (cb: (m: MsgEvent) => void): Promise<UnlistenFn> =>
-  listen<MsgEvent>("mqtt:message", (e) => cb(e.payload))
+// 后端收到/发出消息只发「信号」，前端据此按需重新查询（保证后端权威、前端仅展示）
+export const onMsgSignal = (cb: (connId: string) => void): Promise<UnlistenFn> =>
+  listen<{ connId: string }>("mqtt:msg", (e) => cb(e.payload.connId))
 export const onStatus = (cb: (s: StatusEvent) => void): Promise<UnlistenFn> =>
   listen<StatusEvent>("mqtt:status", (e) => cb(e.payload))
 
@@ -125,6 +175,12 @@ export const brokerStart = (config: BrokerConfig) => invoke<void>("broker_start"
 export const brokerStop = () => invoke<void>("broker_stop")
 export const brokerStatus = () => invoke<boolean>("broker_status")
 export const brokerGetConfig = () => invoke<BrokerConfig>("broker_get_config")
+export interface RetainedRow {
+  topic: string
+  payload: string
+  qos: number
+}
+export const brokerRetained = () => invoke<RetainedRow[]>("broker_retained")
 
 export const onBrokerStats = (cb: (s: BrokerStats) => void) =>
   listen<BrokerStats>("broker:stats", (e) => cb(e.payload))

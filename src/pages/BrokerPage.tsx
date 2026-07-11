@@ -6,10 +6,12 @@ import {
   type BrokerClientRow,
   type BrokerEvt,
   type BrokerStats,
+  type RetainedRow,
   brokerStart,
   brokerStop,
   brokerStatus,
   brokerGetConfig,
+  brokerRetained,
   onBrokerStats,
   onBrokerClients,
   onBrokerEvent,
@@ -39,6 +41,7 @@ export function BrokerPage() {
   const [stats, setStats] = useState<BrokerStats | null>(null)
   const [clients, setClients] = useState<BrokerClientRow[]>([])
   const [events, setEvents] = useState<BrokerEvt[]>([])
+  const [retained, setRetained] = useState<RetainedRow[]>([])
   const logRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -59,6 +62,18 @@ export function BrokerPage() {
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight })
   }, [events.length])
+
+  // 保留消息轮询（运行期间）
+  useEffect(() => {
+    if (!running) {
+      setRetained([])
+      return
+    }
+    const tick = () => brokerRetained().then(setRetained).catch(() => {})
+    tick()
+    const h = setInterval(tick, 2000)
+    return () => clearInterval(h)
+  }, [running])
 
   function patch(p: Partial<BrokerConfig>) {
     setConfig((c) => ({ ...c, ...p }))
@@ -166,6 +181,24 @@ export function BrokerPage() {
               </div>
             ))}
             {events.length === 0 && <div className="py-6 text-center text-muted-foreground">暂无事件</div>}
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* 保留消息检查器 */}
+      <Card>
+        <CardContent className="flex flex-col gap-2 p-3 sm:p-4">
+          <span className="text-sm font-medium">保留消息 ({retained.length})</span>
+          <Separator />
+          <div className="flex max-h-[30vh] flex-col gap-1 overflow-y-auto">
+            {retained.map((r) => (
+              <div key={r.topic} className="flex items-baseline gap-2 rounded-md bg-muted/40 px-2.5 py-1.5 text-xs">
+                <span className="font-mono text-primary">{r.topic}</span>
+                <Badge variant="secondary" className="h-4 px-1 text-[10px]">Q{r.qos}</Badge>
+                <span className="truncate font-mono text-muted-foreground">{r.payload}</span>
+              </div>
+            ))}
+            {retained.length === 0 && <div className="py-6 text-center text-sm text-muted-foreground">暂无保留消息</div>}
           </div>
         </CardContent>
       </Card>

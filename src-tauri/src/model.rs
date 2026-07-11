@@ -53,25 +53,3 @@ fn default_true() -> bool {
 fn default_mqtt_version() -> u8 {
     4
 }
-
-/// 推送给前端的收发消息事件。
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct MessageEvent {
-    pub conn_id: String,
-    pub dir: String, // rx | tx
-    pub topic: String,
-    pub payload: String,
-    pub qos: u8,
-    pub retain: bool,
-    pub ts: u64,
-}
-
-/// 推送给前端的连接状态事件。
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct StatusEvent {
-    pub conn_id: String,
-    pub status: String, // connecting | connected | reconnecting | disconnected | error
-    pub detail: Option<String>,
-}
