@@ -126,6 +126,9 @@ jobs:
           distribution: temurin
           java-version: 21
 
+      - name: 配置 Gradle 缓存
+        uses: gradle/actions/setup-gradle@v4
+
       - name: 安装 pnpm
         uses: pnpm/action-setup@v6
         with:
@@ -341,12 +344,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: 安装系统依赖
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libssl-dev \
-            libsoup-3.0-dev libayatana-appindicator3-dev libxdo-dev \
+      - name: 安装系统依赖（带 apt 缓存）
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          version: v1
+          packages: >-
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libssl-dev
+            libsoup-3.0-dev libayatana-appindicator3-dev libxdo-dev
             patchelf build-essential curl wget file rpm
 
       - name: 安装 pnpm
