@@ -142,6 +142,41 @@ pub struct BrokerConfig {
     /// 安全 WebSocket(wss) 监听端口，0=关闭；复用 tls_cert/tls_key。
     #[serde(default)]
     pub wss_port: u16,
+    /// 多用户 + 主题级 ACL；非空时启用（匿名是否放行仍由 allow_anonymous 决定）。
+    #[serde(default)]
+    pub users: Vec<UserAcl>,
+    /// 是否发布 $SYS 监控主题。
+    #[serde(default = "yes")]
+    pub sys_enabled: bool,
+}
+
+/// 单个用户及其发布/订阅 ACL（过滤器列表；为空表示不限制）。
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UserAcl {
+    pub username: String,
+    pub password: String,
+    #[serde(default)]
+    pub pub_acl: Vec<String>,
+    #[serde(default)]
+    pub sub_acl: Vec<String>,
+}
+
+/// ACL 判定：list 为空=放行；否则要求 topic/filter 命中任一模式。
+fn acl_allows(list: &[String], topic: &str) -> bool {
+    list.is_empty() || list.iter().any(|f| topic_matches(f, topic))
+}
+
+/// 解析共享订阅 `$share/{group}/{filter}` -> (group, filter)。
+fn parse_share(filter: &str) -> Option<(String, String)> {
+    let rest = filter.strip_prefix("$share/")?;
+    let mut it = rest.splitn(2, '/');
+    let group = it.next()?;
+    let real = it.next()?;
+    if group.is_empty() || group.contains('+') || group.contains('#') || real.is_empty() {
+        return None;
+    }
+    Some((group.to_string(), real.to_string()))
 }
 fn yes() -> bool {
     true
@@ -160,6 +195,8 @@ impl Default for BrokerConfig {
             tls_key: String::new(),
             ws_port: 0,
             wss_port: 0,
+            users: vec![],
+            sys_enabled: true,
         }
     }
 }
@@ -624,6 +661,8 @@ struct Sub {
     nolocal: bool,
     rap: bool,
     sub_id: Option<usize>,
+    /// 共享订阅组名（`$share/group/...`）；None 为普通订阅。
+    share_group: Option<String>,
 }
 struct Conn {
     tx: mpsc::Sender<Out>,
@@ -734,6 +773,8 @@ impl Session {
 struct Core {
     sessions: HashMap<String, Session>,
     retained: HashMap<String, Msg>,
+    /// 共享订阅轮询游标：(group, filter) -> 下一个索引。
+    shared_rr: HashMap<(String, String), usize>,
 }
 impl Core {
     fn online_count(&self) -> u64 {
@@ -988,6 +1029,9 @@ pub async fn start(
         let core = core.clone();
         let counters = counters.clone();
         let mut sd = sd_rx.clone();
+        let sys_enabled = config.sys_enabled;
+        let start_ms = now_ms();
+        let mut tick = 0u64;
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -1009,16 +1053,37 @@ pub async fn start(
                                 }).collect();
                             (rows, g.retained.len() as u64, g.sessions.len() as u64)
                         };
+                        let connected = counters.connected.load(Ordering::Relaxed);
+                        let recv = counters.recv.load(Ordering::Relaxed);
+                        let sent = counters.sent.load(Ordering::Relaxed);
+                        let dropped = counters.dropped.load(Ordering::Relaxed);
                         sink_emit(&Some(sink.clone()), "broker:stats", BrokerStats {
                             running: true,
-                            clients_connected: counters.connected.load(Ordering::Relaxed),
-                            msgs_received: counters.recv.load(Ordering::Relaxed),
-                            msgs_sent: counters.sent.load(Ordering::Relaxed),
+                            clients_connected: connected,
+                            msgs_received: recv,
+                            msgs_sent: sent,
                             retained,
-                            dropped: counters.dropped.load(Ordering::Relaxed),
+                            dropped,
                             sessions,
                         });
                         sink_emit(&Some(sink.clone()), "broker:clients", rows);
+                        // $SYS 监控主题（每 5 秒刷新，保留下发）。
+                        tick += 1;
+                        if sys_enabled && tick % 5 == 0 {
+                            let up = (now_ms().saturating_sub(start_ms)) / 1000;
+                            let sys: [(&str, String); 7] = [
+                                ("$SYS/broker/version", format!("KenkoMQTT {}", env!("CARGO_PKG_VERSION"))),
+                                ("$SYS/broker/uptime", up.to_string()),
+                                ("$SYS/broker/clients/connected", connected.to_string()),
+                                ("$SYS/broker/sessions/total", sessions.to_string()),
+                                ("$SYS/broker/messages/received", recv.to_string()),
+                                ("$SYS/broker/messages/sent", sent.to_string()),
+                                ("$SYS/broker/messages/dropped", dropped.to_string()),
+                            ];
+                            for (t, v) in sys {
+                                publish_sys(&core, &counters, t, v);
+                            }
+                        }
                     }
                 }
             }
@@ -1113,6 +1178,10 @@ async fn handle_conn<S>(
     let mut kicked = false;
     let mut my_proto = 0u8; // 0=未定
     let mut inbound_alias: HashMap<u16, String> = HashMap::new();
+    // ACL（匹配到具体用户后启用；否则不限制）。
+    let mut pub_acl: Vec<String> = vec![];
+    let mut sub_acl: Vec<String> = vec![];
+    let mut acl_on = false;
 
     let mut keepalive = Duration::from_secs(0);
     let idle = tokio::time::sleep(Duration::from_secs(3600));
@@ -1147,8 +1216,25 @@ async fn handle_conn<S>(
                     match item {
                         In::Connect(c) => {
                             if connected { break 'conn; }
-                            let auth_ok = config.allow_anonymous
-                                || (c.has_login && c.username == config.username && c.password == config.password);
+                            // 鉴权：优先用户表(带 ACL)，否则回退单账号/匿名。
+                            let auth_ok = if !config.users.is_empty() {
+                                if c.has_login {
+                                    if let Some(u) = config.users.iter()
+                                        .find(|u| u.username == c.username && u.password == c.password) {
+                                        pub_acl = u.pub_acl.clone();
+                                        sub_acl = u.sub_acl.clone();
+                                        acl_on = true;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    config.allow_anonymous
+                                }
+                            } else {
+                                config.allow_anonymous
+                                    || (c.has_login && c.username == config.username && c.password == config.password)
+                            };
                             let assigned = c.client_id.is_empty();
                             let cid = if assigned { format!("auto-{}", now_ms()) } else { c.client_id.clone() };
                             let full = {
@@ -1211,32 +1297,51 @@ async fn handle_conn<S>(
                                 let mut g = core.lock().unwrap();
                                 if let Some(sess) = g.sessions.get_mut(&client_id) {
                                     for f in &filters {
-                                        if !valid_filter(&f.path) {
+                                        // 解析共享订阅前缀，得到 (组, 真实过滤器)。
+                                        let (share_group, real_filter) = match parse_share(&f.path) {
+                                            Some((grp, real)) => {
+                                                if !valid_filter(&real) { codes.push(0x80); continue; }
+                                                (Some(grp), real)
+                                            }
+                                            None => {
+                                                if f.path.starts_with("$share") {
+                                                    codes.push(0x80); continue; // 非法共享订阅
+                                                }
+                                                if !valid_filter(&f.path) { codes.push(0x80); continue; }
+                                                (None, f.path.clone())
+                                            }
+                                        };
+                                        // ACL：订阅授权校验。
+                                        if acl_on && !acl_allows(&sub_acl, &real_filter) {
                                             codes.push(0x80);
                                             continue;
                                         }
                                         let granted = f.qos;
-                                        let existed = sess.subs.iter().any(|s| s.filter == f.path);
+                                        // 会话内唯一键：(share_group, filter)。
+                                        let matches_existing = |s: &Sub| s.filter == real_filter && s.share_group == share_group;
+                                        let existed = sess.subs.iter().any(matches_existing);
                                         let sub = Sub {
-                                            filter: f.path.clone(),
+                                            filter: real_filter.clone(),
                                             qos: qos_from_u8(granted),
                                             nolocal: f.nolocal,
                                             rap: f.rap,
                                             sub_id,
+                                            share_group: share_group.clone(),
                                         };
-                                        if let Some(e) = sess.subs.iter_mut().find(|s| s.filter == f.path) {
+                                        if let Some(e) = sess.subs.iter_mut().find(|s| s.filter == real_filter && s.share_group == share_group) {
                                             *e = sub;
                                         } else {
                                             sess.subs.push(sub);
                                         }
                                         codes.push(granted);
-                                        let send_ret = match f.retain_handling {
+                                        // 共享订阅不下发保留消息。
+                                        let send_ret = share_group.is_none() && match f.retain_handling {
                                             2 => false,
                                             1 => !existed,
                                             _ => true,
                                         };
                                         if send_ret {
-                                            deliver_retained.push((f.path.clone(), granted, f.rap));
+                                            deliver_retained.push((real_filter.clone(), granted, f.rap));
                                         }
                                     }
                                 }
@@ -1293,7 +1398,16 @@ async fn handle_conn<S>(
                             {
                                 let mut g = core.lock().unwrap();
                                 if let Some(sess) = g.sessions.get_mut(&client_id) {
-                                    sess.subs.retain(|s| !topics.contains(&s.filter));
+                                    // 退订项可能带 $share 前缀，需归一为 (组, 真实过滤器) 再匹配。
+                                    let keys: Vec<(Option<String>, String)> = topics.iter().map(|t| {
+                                        match parse_share(t) {
+                                            Some((grp, real)) => (Some(grp), real),
+                                            None => (None, t.clone()),
+                                        }
+                                    }).collect();
+                                    sess.subs.retain(|s| {
+                                        !keys.iter().any(|(g, f)| *g == s.share_group && *f == s.filter)
+                                    });
                                 }
                             }
                             let _ = tx.send(Out::UnsubAck { pkid, n }).await;
@@ -1315,6 +1429,16 @@ async fn handle_conn<S>(
                                 }
                             }
                             if !valid_topic(&m.topic) { break 'conn; }
+                            // ACL：发布授权校验。未授权则不路由（仍对 QoS1/2 正常回执，避免客户端卡死）。
+                            let pub_ok = !acl_on || acl_allows(&pub_acl, &m.topic);
+                            if !pub_ok {
+                                match m.qos {
+                                    QoS::AtMostOnce => {}
+                                    QoS::AtLeastOnce => { let _ = tx.send(Out::PubAck(m.pkid)).await; }
+                                    QoS::ExactlyOnce => { let _ = tx.send(Out::PubRec(m.pkid)).await; }
+                                }
+                                continue;
+                            }
                             match m.qos {
                                 QoS::AtMostOnce => {
                                     counters.recv.fetch_add(1, Ordering::Relaxed);
@@ -1440,7 +1564,22 @@ fn emit_publish(app: &Option<Arc<dyn EventSink>>, client_id: &str, m: &Msg) {
     });
 }
 
-/// 路由一条发布消息到所有匹配订阅者（含离线持久会话入队）。
+/// 发布一条 $SYS 监控消息（QoS0，保留下发）。
+fn publish_sys(core: &Arc<Mutex<Core>>, counters: &Arc<Counters>, topic: &str, payload: String) {
+    let m = Msg::simple(topic.to_string(), QoS::AtMostOnce, true, Bytes::from(payload.into_bytes()));
+    route_publish(core, counters, "$SYS", &m);
+}
+
+/// 一个投递目标（普通订阅或被选中的共享订阅成员）。
+#[derive(Clone)]
+struct Recip {
+    key: String,
+    qos: QoS,
+    rap: bool,
+    sub_ids: Vec<usize>,
+}
+
+/// 路由一条发布消息到所有匹配订阅者（普通 + 共享订阅；含离线持久会话入队）。
 /// `from` 为发布者 client_id，用于 No Local 处理。
 fn route_publish(core: &Arc<Mutex<Core>>, counters: &Arc<Counters>, from: &str, m: &Msg) {
     let mut g = core.lock().unwrap();
@@ -1453,37 +1592,74 @@ fn route_publish(core: &Arc<Mutex<Core>>, counters: &Arc<Counters>, from: &str, 
             g.retained.insert(m.topic.clone(), r);
         }
     }
-    let mut sent = 0u64;
-    let mut dropped = 0u64;
-    for (key, sess) in g.sessions.iter_mut() {
+
+    // 阶段一：收集普通投递目标 + 共享订阅候选（不可变遍历）。
+    let mut recips: Vec<Recip> = vec![];
+    let mut shared: HashMap<(String, String), Vec<Recip>> = HashMap::new();
+    for (key, sess) in g.sessions.iter() {
         let mut best: Option<QoS> = None;
         let mut rap = false;
         let mut sub_ids: Vec<usize> = vec![];
         for s in &sess.subs {
-            if topic_matches(&s.filter, &m.topic) {
-                if s.nolocal && key == from {
-                    continue;
+            if !topic_matches(&s.filter, &m.topic) || (s.nolocal && key == from) {
+                continue;
+            }
+            match &s.share_group {
+                None => {
+                    best = Some(match best {
+                        Some(b) if (b as u8) >= (s.qos as u8) => b,
+                        _ => s.qos,
+                    });
+                    rap |= s.rap;
+                    if let Some(id) = s.sub_id {
+                        sub_ids.push(id);
+                    }
                 }
-                best = Some(match best {
-                    Some(b) if (b as u8) >= (s.qos as u8) => b,
-                    _ => s.qos,
-                });
-                rap |= s.rap;
-                if let Some(id) = s.sub_id {
-                    sub_ids.push(id);
+                Some(grp) => {
+                    shared
+                        .entry((grp.clone(), s.filter.clone()))
+                        .or_default()
+                        .push(Recip {
+                            key: key.clone(),
+                            qos: s.qos,
+                            rap: s.rap,
+                            sub_ids: s.sub_id.into_iter().collect(),
+                        });
                 }
             }
         }
-        let Some(sub_qos) = best else { continue };
-        let eff = qos_min(m.qos, sub_qos);
-        let mut out = m.clone();
-        out.retain = if rap { m.retain } else { false };
-        out.props.subscription_ids = sub_ids;
-        let online = sess.online.is_some();
-        let n = sess.deliver(out, eff);
-        sent += n;
-        if online && eff == QoS::AtMostOnce && n == 0 {
-            dropped += 1;
+        if let Some(q) = best {
+            recips.push(Recip { key: key.clone(), qos: q, rap, sub_ids });
+        }
+    }
+    // 每个共享组按轮询选一个成员。
+    let mut groups: Vec<((String, String), Vec<Recip>)> = shared.into_iter().collect();
+    groups.sort_by(|a, b| a.0.cmp(&b.0));
+    for (gf, cands) in groups {
+        if cands.is_empty() {
+            continue;
+        }
+        let cursor = g.shared_rr.entry(gf).or_insert(0);
+        let idx = *cursor % cands.len();
+        *cursor = cursor.wrapping_add(1);
+        recips.push(cands[idx].clone());
+    }
+
+    // 阶段二：实际投递。
+    let mut sent = 0u64;
+    let mut dropped = 0u64;
+    for r in recips {
+        if let Some(sess) = g.sessions.get_mut(&r.key) {
+            let eff = qos_min(m.qos, r.qos);
+            let mut out = m.clone();
+            out.retain = if r.rap { m.retain } else { false };
+            out.props.subscription_ids = r.sub_ids;
+            let online = sess.online.is_some();
+            let n = sess.deliver(out, eff);
+            sent += n;
+            if online && eff == QoS::AtMostOnce && n == 0 {
+                dropped += 1;
+            }
         }
     }
     counters.sent.fetch_add(sent, Ordering::Relaxed);
@@ -1881,5 +2057,145 @@ mod tests {
             }
         }
         panic!("WS 监听往返失败");
+    }
+
+    fn acl_user() -> BrokerConfig {
+        BrokerConfig {
+            allow_anonymous: true,
+            users: vec![UserAcl {
+                username: "u".into(),
+                password: "p".into(),
+                pub_acl: vec!["ok/#".into()],
+                sub_acl: vec!["ok/#".into()],
+            }],
+            ..Default::default()
+        }
+    }
+
+    // P2: 订阅 ACL —— 授权外的过滤器返回失败码。
+    #[tokio::test]
+    async fn test_sub_acl() {
+        use rumqttc::{AsyncClient, Event, MqttOptions, Packet as CPacket, QoS, SubscribeFilter, SubscribeReasonCode};
+        let port = spawn_broker(acl_user());
+        let mut o = MqttOptions::new("aclsub", "127.0.0.1", port);
+        o.set_keep_alive(Duration::from_secs(5));
+        o.set_credentials("u", "p");
+        let (c, mut el) = AsyncClient::new(o, 10);
+        c.subscribe_many(vec![
+            SubscribeFilter::new("ok/x".into(), QoS::AtLeastOnce),
+            SubscribeFilter::new("deny/x".into(), QoS::AtLeastOnce),
+        ]).await.unwrap();
+        for _ in 0..60 {
+            if let Event::Incoming(CPacket::SubAck(sa)) = el.poll().await.unwrap() {
+                assert!(matches!(sa.return_codes[0], SubscribeReasonCode::Success(_)), "ok/x 应授权");
+                assert!(matches!(sa.return_codes[1], SubscribeReasonCode::Failure), "deny/x 应被拒");
+                return;
+            }
+        }
+        panic!("未收到 SubAck");
+    }
+
+    // P2: 发布 ACL —— 授权外主题不被路由。
+    #[tokio::test]
+    async fn test_pub_acl() {
+        use rumqttc::{AsyncClient, Event, MqttOptions, Packet as CPacket, QoS};
+        let port = spawn_broker(acl_user());
+        // 匿名订阅者(无 ACL)订阅两个主题。
+        let mut so = MqttOptions::new("anon", "127.0.0.1", port);
+        so.set_keep_alive(Duration::from_secs(5));
+        let (sub, mut sel) = AsyncClient::new(so, 10);
+        sub.subscribe("deny/#", QoS::AtLeastOnce).await.unwrap();
+        sub.subscribe("ok/#", QoS::AtLeastOnce).await.unwrap();
+        // 授权用户发布：deny/a 应被拦截，ok/a 应通过。
+        let mut po = MqttOptions::new("aclpub", "127.0.0.1", port);
+        po.set_keep_alive(Duration::from_secs(5));
+        po.set_credentials("u", "p");
+        let (publisher, mut pel) = AsyncClient::new(po, 10);
+        tokio::spawn(async move { loop { if pel.poll().await.is_err() { break; } } });
+        let mut subs_done = 0;
+        for _ in 0..120 {
+            match sel.poll().await.unwrap() {
+                Event::Incoming(CPacket::SubAck(_)) => {
+                    subs_done += 1;
+                    if subs_done == 2 {
+                        publisher.publish("deny/a", QoS::AtLeastOnce, false, b"blocked".to_vec()).await.unwrap();
+                        publisher.publish("ok/a", QoS::AtLeastOnce, false, b"passed".to_vec()).await.unwrap();
+                    }
+                }
+                Event::Incoming(CPacket::Publish(p)) => {
+                    // 第一条到达的必须是 ok/a（deny/a 已被拦截）。
+                    assert_eq!(p.topic, "ok/a", "被拒主题不应送达");
+                    assert_eq!(&p.payload[..], b"passed");
+                    return;
+                }
+                _ => {}
+            }
+        }
+        panic!("发布 ACL 测试未收到消息");
+    }
+
+    // P2: 共享订阅 —— 组内消息按轮询分发到不同成员。
+    #[tokio::test]
+    async fn test_shared_subscription() {
+        use rumqttc::{AsyncClient, Event, MqttOptions, Packet as CPacket, QoS};
+        use std::sync::atomic::AtomicUsize;
+        let port = spawn_broker(BrokerConfig::default());
+        let ca = Arc::new(AtomicUsize::new(0));
+        let cb = Arc::new(AtomicUsize::new(0));
+        for (id, cnt) in [("sa", ca.clone()), ("sb", cb.clone())] {
+            let mut o = MqttOptions::new(id, "127.0.0.1", port);
+            o.set_keep_alive(Duration::from_secs(5));
+            let (c, mut el) = AsyncClient::new(o, 10);
+            c.subscribe("$share/g/sh/#", QoS::AtLeastOnce).await.unwrap();
+            tokio::spawn(async move {
+                loop {
+                    match el.poll().await {
+                        Ok(Event::Incoming(CPacket::Publish(_))) => { cnt.fetch_add(1, Ordering::Relaxed); }
+                        Err(_) => break,
+                        _ => {}
+                    }
+                }
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut po = MqttOptions::new("shpub", "127.0.0.1", port);
+        po.set_keep_alive(Duration::from_secs(5));
+        let (publisher, mut pel) = AsyncClient::new(po, 10);
+        tokio::spawn(async move { loop { if pel.poll().await.is_err() { break; } } });
+        for i in 0..6 {
+            publisher.publish("sh/x", QoS::AtLeastOnce, false, format!("m{i}").into_bytes()).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let a = ca.load(Ordering::Relaxed);
+        let b = cb.load(Ordering::Relaxed);
+        assert_eq!(a + b, 6, "共享订阅每条消息应恰好投递一次 (a={a}, b={b})");
+        assert!(a > 0 && b > 0, "轮询应在成员间分发 (a={a}, b={b})");
+    }
+
+    // P2: $SYS 监控主题。
+    #[tokio::test]
+    async fn test_sys_topics() {
+        use rumqttc::{AsyncClient, Event, MqttOptions, Packet as CPacket, QoS};
+        let port = free_port();
+        let cfg = BrokerConfig { host: "127.0.0.1".into(), port, ..Default::default() };
+        start_cfg(cfg).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut o = MqttOptions::new("sysmon", "127.0.0.1", port);
+        o.set_keep_alive(Duration::from_secs(30));
+        let (c, mut el) = AsyncClient::new(o, 10);
+        c.subscribe("$SYS/#", QoS::AtMostOnce).await.unwrap();
+        // $SYS 每 5 秒刷新，最多等 ~8 秒。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() { panic!("未收到 $SYS 消息"); }
+            match tokio::time::timeout(remaining, el.poll()).await {
+                Ok(Ok(Event::Incoming(CPacket::Publish(p)))) => {
+                    if p.topic.starts_with("$SYS/broker/") { return; }
+                }
+                Ok(_) => {}
+                Err(_) => panic!("等待 $SYS 超时"),
+            }
+        }
     }
 }
