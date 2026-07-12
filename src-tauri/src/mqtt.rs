@@ -1,10 +1,11 @@
 //! 多连接 MQTT 管理器（MQTT 3.1.1/5.0，TCP/TLS/WS/WSS）。
 //! 消息与计算均在后端：原始报文入库，按需做 过滤/格式解码/主题树/图表聚合/占位符/定时发布/导出。
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json_path::JsonPath;
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter, State};
@@ -25,13 +26,21 @@ struct ConnHandle {
     task: JoinHandle<()>,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
 struct StoredMsg {
-    dir: &'static str, // rx | tx
+    dir: String, // rx | tx
     topic: String,
     payload: Vec<u8>,
     qos: u8,
     retain: bool,
     ts: u64,
+}
+
+/// 单连接落盘结构（含 connId，便于安全化文件名后仍能还原原始 id）。
+#[derive(Serialize, Deserialize)]
+struct PersistedConn {
+    conn_id: String,
+    msgs: Vec<StoredMsg>,
 }
 
 type MsgLog = Arc<Mutex<HashMap<String, VecDeque<StoredMsg>>>>;
@@ -41,6 +50,10 @@ pub struct Manager {
     conns: Mutex<HashMap<String, ConnHandle>>,
     store: MsgLog,
     schedules: Mutex<HashMap<String, JoinHandle<()>>>,
+    /// 消息落盘目录（应用数据目录下 messages/）。启动时由 setup 注入并载入历史。
+    msg_dir: Mutex<Option<PathBuf>>,
+    /// 自上次 flush 以来有新消息的连接（Arc 以便注入到各连接的事件循环任务）。
+    dirty: Arc<Mutex<HashSet<String>>>,
 }
 
 // ---- 前端展示用的序列化类型 ----
@@ -74,7 +87,7 @@ pub struct ContentPoint {
     pub v: f64,
 }
 
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -129,12 +142,18 @@ fn record(store: &MsgLog, app: &AppHandle, conn_id: &str, dir: &'static str, top
     {
         let mut g = store.lock().unwrap();
         let dq = g.entry(conn_id.to_string()).or_default();
-        dq.push_back(StoredMsg { dir, topic, payload, qos, retain, ts: now_ms() });
+        dq.push_back(StoredMsg { dir: dir.to_string(), topic, payload, qos, retain, ts: now_ms() });
         while dq.len() > MAX_MSGS {
             dq.pop_front();
         }
     }
     let _ = app.emit("mqtt:msg", serde_json::json!({ "connId": conn_id }));
+}
+
+/// 记录消息并把连接标记为脏（供落盘），record 的入库口统一走这里。
+fn record_mgr(mgr: &Manager, app: &AppHandle, conn_id: &str, dir: &'static str, topic: String, payload: Vec<u8>, qos: u8, retain: bool) {
+    record(&mgr.store, app, conn_id, dir, topic, payload, qos, retain);
+    mgr.dirty.lock().unwrap().insert(conn_id.to_string());
 }
 
 impl ClientKind {
@@ -212,6 +231,60 @@ impl Manager {
 
     pub fn clear_msgs(&self, conn_id: &str) {
         self.store.lock().unwrap().remove(conn_id);
+        self.dirty.lock().unwrap().remove(conn_id);
+        if let Some(p) = self.msg_file(conn_id) {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    // ---- 消息落盘：每连接一个 {connId}.json（存最近 MAX_MSGS 条） ----
+
+    fn msg_file(&self, conn_id: &str) -> Option<PathBuf> {
+        let g = self.msg_dir.lock().unwrap();
+        let dir = g.as_ref()?;
+        // 文件名安全化：仅保留字母数字与 -_，其余替换为 _。
+        let safe: String = conn_id.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+        Some(dir.join(format!("{safe}.json")))
+    }
+
+    /// 注入落盘目录并载入历史消息（启动时调用一次）。
+    pub fn init_persistence(&self, dir: PathBuf) {
+        let _ = std::fs::create_dir_all(&dir);
+        *self.msg_dir.lock().unwrap() = Some(dir.clone());
+        // 载入历史：目录下每个 .json 文件名即为 connId 的安全化形式。此处以文件内嵌的 connId 为准。
+        let Ok(rd) = std::fs::read_dir(&dir) else { return };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(data) = std::fs::read(&path) else { continue };
+            let Ok(persisted) = serde_json::from_slice::<PersistedConn>(&data) else { continue };
+            let mut g = self.store.lock().unwrap();
+            g.insert(persisted.conn_id, persisted.msgs.into_iter().collect());
+        }
+    }
+
+    /// 将脏连接的消息写盘。
+    pub fn flush(&self) {
+        let dirty: Vec<String> = { self.dirty.lock().unwrap().drain().collect() };
+        if dirty.is_empty() {
+            return;
+        }
+        for conn_id in dirty {
+            let msgs: Vec<StoredMsg> = {
+                let g = self.store.lock().unwrap();
+                match g.get(&conn_id) {
+                    Some(dq) => dq.iter().cloned().collect(),
+                    None => continue,
+                }
+            };
+            let Some(path) = self.msg_file(&conn_id) else { continue };
+            let payload = PersistedConn { conn_id: conn_id.clone(), msgs };
+            if let Ok(bytes) = serde_json::to_vec(&payload) {
+                let _ = std::fs::write(&path, bytes);
+            }
+        }
     }
 
     pub fn topic_tree(&self, conn_id: &str) -> Vec<TreeNode> {
@@ -288,28 +361,48 @@ impl Manager {
         Ok(pts)
     }
 
-    /// 导出消息为 CSV 或 JSON 文本。
-    pub fn export_messages(&self, conn_id: &str, as_csv: bool, fmt: Format) -> String {
+    /// 导出消息为 CSV / JSON / TXT 文本。
+    pub fn export_messages(&self, conn_id: &str, kind: &str, fmt: Format) -> String {
         let g = self.store.lock().unwrap();
         let Some(dq) = g.get(conn_id) else { return String::new() };
-        if as_csv {
-            let mut s = String::from("ts,dir,topic,payload,qos,retain\n");
-            for m in dq.iter() {
-                let p = codec::decode(&m.payload, fmt).replace('"', "\"\"");
-                s.push_str(&format!("{},{},{},\"{}\",{},{}\n", m.ts, m.dir, m.topic, p, m.qos, m.retain));
+        match kind {
+            "csv" => {
+                let mut s = String::from("ts,dir,topic,payload,qos,retain\n");
+                for m in dq.iter() {
+                    let p = codec::decode(&m.payload, fmt).replace('"', "\"\"");
+                    s.push_str(&format!("{},{},{},\"{}\",{},{}\n", m.ts, m.dir, m.topic, p, m.qos, m.retain));
+                }
+                s
             }
-            s
-        } else {
-            let rows: Vec<_> = dq
-                .iter()
-                .map(|m| {
-                    serde_json::json!({
-                        "ts": m.ts, "dir": m.dir, "topic": m.topic,
-                        "payload": codec::decode(&m.payload, fmt), "qos": m.qos, "retain": m.retain
+            "txt" => {
+                let mut s = String::new();
+                for m in dq.iter() {
+                    let arrow = if m.dir == "rx" { "<-" } else { "->" };
+                    let payload = codec::decode(&m.payload, fmt);
+                    s.push_str(&format!(
+                        "[{}] {} {} (QoS{}{})\n{}\n\n",
+                        m.ts,
+                        arrow,
+                        m.topic,
+                        m.qos,
+                        if m.retain { ",retain" } else { "" },
+                        payload
+                    ));
+                }
+                s
+            }
+            _ => {
+                let rows: Vec<_> = dq
+                    .iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "ts": m.ts, "dir": m.dir, "topic": m.topic,
+                            "payload": codec::decode(&m.payload, fmt), "qos": m.qos, "retain": m.retain
+                        })
                     })
-                })
-                .collect();
-            serde_json::to_string_pretty(&rows).unwrap_or_default()
+                    .collect();
+                serde_json::to_string_pretty(&rows).unwrap_or_default()
+            }
         }
     }
 }
@@ -382,13 +475,15 @@ fn connect_v4(app: AppHandle, mgr: &Manager, conn_id: &str, client_id: &str, p: 
     let app2 = app.clone();
     let id = conn_id.to_string();
     let store = mgr.store.clone();
+    let dirty = mgr.dirty.clone();
     let task = tauri::async_runtime::spawn(async move {
         emit_status(&app2, &id, "connecting", None);
         loop {
             match eventloop.poll().await {
                 Ok(Event::Incoming(Packet::ConnAck(_))) => emit_status(&app2, &id, "connected", None),
                 Ok(Event::Incoming(Packet::Publish(pkt))) => {
-                    record(&store, &app2, &id, "rx", pkt.topic.clone(), pkt.payload.to_vec(), pkt.qos as u8, pkt.retain)
+                    record(&store, &app2, &id, "rx", pkt.topic.clone(), pkt.payload.to_vec(), pkt.qos as u8, pkt.retain);
+                    dirty.lock().unwrap().insert(id.clone());
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -420,21 +515,25 @@ fn connect_v5(app: AppHandle, mgr: &Manager, conn_id: &str, client_id: &str, p: 
     let app2 = app.clone();
     let id = conn_id.to_string();
     let store = mgr.store.clone();
+    let dirty = mgr.dirty.clone();
     let task = tauri::async_runtime::spawn(async move {
         emit_status(&app2, &id, "connecting", None);
         loop {
             match eventloop.poll().await {
                 Ok(Event::Incoming(Packet::ConnAck(_))) => emit_status(&app2, &id, "connected", None),
-                Ok(Event::Incoming(Packet::Publish(pkt))) => record(
-                    &store,
-                    &app2,
-                    &id,
-                    "rx",
-                    String::from_utf8_lossy(&pkt.topic).to_string(),
-                    pkt.payload.to_vec(),
-                    pkt.qos as u8,
-                    pkt.retain,
-                ),
+                Ok(Event::Incoming(Packet::Publish(pkt))) => {
+                    record(
+                        &store,
+                        &app2,
+                        &id,
+                        "rx",
+                        String::from_utf8_lossy(&pkt.topic).to_string(),
+                        pkt.payload.to_vec(),
+                        pkt.qos as u8,
+                        pkt.retain,
+                    );
+                    dirty.lock().unwrap().insert(id.clone());
+                }
                 Ok(_) => {}
                 Err(e) => {
                     emit_status(&app2, &id, "error", Some(e.to_string()));
@@ -486,7 +585,7 @@ pub async fn publish(
     let bytes = codec::encode(&text, fmt)?;
     let c = mgr.client_of(&conn_id).ok_or("未连接")?;
     c.publish(topic.clone(), bytes.clone(), qos, retain).await?;
-    record(&mgr.store, &app, &conn_id, "tx", topic, bytes, qos, retain);
+    record_mgr(&mgr, &app, &conn_id, "tx", topic, bytes, qos, retain);
     Ok(())
 }
 
@@ -505,6 +604,7 @@ pub fn schedule_start(
     let fmt = format.unwrap_or(Format::Plaintext);
     let id = format!("sch-{}-{}", conn_id, now_ms());
     let store = mgr.store.clone();
+    let dirty = mgr.dirty.clone();
     let app2 = app.clone();
     let cid = conn_id.clone();
     let handle = tauri::async_runtime::spawn(async move {
@@ -521,6 +621,7 @@ pub fn schedule_start(
                 break;
             }
             record(&store, &app2, &cid, "tx", topic.clone(), bytes, qos, retain);
+            dirty.lock().unwrap().insert(cid.clone());
         }
     });
     mgr.schedules.lock().unwrap().insert(id.clone(), handle);

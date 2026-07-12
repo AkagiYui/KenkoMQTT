@@ -30,6 +30,7 @@ import {
   DEFAULT_PORTS,
 } from "@/lib/api"
 import { cn, formatTime, tryPrettyJSON } from "@/lib/utils"
+import { pushLog } from "@/lib/log"
 import { LineChart } from "@/components/LineChart"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -131,7 +132,10 @@ export function ClientPage() {
 
   useEffect(() => {
     loadProfiles()
-    const us = onStatus((s) => setStatusMap((prev) => ({ ...prev, [s.connId]: s.status })))
+    const us = onStatus((s) => {
+      setStatusMap((prev) => ({ ...prev, [s.connId]: s.status }))
+      pushLog(s.status === "error" ? "error" : "info", "mqtt", `${s.connId.slice(0, 8)} ${s.status}${s.detail ? ": " + s.detail : ""}`)
+    })
     const um = onMsgSignal((cid) => {
       if (cid !== connIdRef.current) return
       if (refreshTimer.current) return // 节流：最多每 250ms 拉一次
@@ -140,9 +144,12 @@ export function ClientPage() {
         refreshMsgs()
       }, 250)
     })
+    const onProfiles = () => loadProfiles()
+    window.addEventListener("profiles-changed", onProfiles)
     return () => {
       us.then((f) => f())
       um.then((f) => f())
+      window.removeEventListener("profiles-changed", onProfiles)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -287,9 +294,9 @@ export function ClientPage() {
       }
     }
   }
-  async function doExport(csv: boolean) {
-    const text = await exportMessages(connId, csv, format).catch(() => "")
-    download(`${form.name || "messages"}.${csv ? "csv" : "json"}`, text)
+  async function doExport(kind: "csv" | "json" | "txt") {
+    const text = await exportMessages(connId, kind, format).catch(() => "")
+    download(`${form.name || "messages"}.${kind}`, text)
   }
 
   const isTls = form.protocol === "tls" || form.protocol === "wss"
@@ -482,8 +489,9 @@ export function ClientPage() {
             <Input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="过滤主题/内容（后端）" className="h-8 max-w-xs" />
             <FormatSelect value={format} onChange={setFormat} className="h-8" />
             <div className="ml-auto flex gap-2">
-              <Button variant="outline" size="sm" className="h-8 gap-1" onClick={() => doExport(true)}><Download className="size-3.5" />CSV</Button>
-              <Button variant="outline" size="sm" className="h-8 gap-1" onClick={() => doExport(false)}><Download className="size-3.5" />JSON</Button>
+              <Button variant="outline" size="sm" className="h-8 gap-1" onClick={() => doExport("csv")}><Download className="size-3.5" />CSV</Button>
+              <Button variant="outline" size="sm" className="h-8 gap-1" onClick={() => doExport("json")}><Download className="size-3.5" />JSON</Button>
+              <Button variant="outline" size="sm" className="h-8 gap-1" onClick={() => doExport("txt")}><Download className="size-3.5" />TXT</Button>
               <Button variant="outline" size="sm" className="h-8" onClick={() => { messagesClear(connId); refreshMsgs() }}>清空</Button>
             </div>
           </div>

@@ -72,6 +72,18 @@ export const listProfiles = () => invoke<Profile[]>("list_profiles")
 export const saveProfile = (profile: Profile) => invoke<Profile>("save_profile", { profile })
 export const deleteProfile = (id: string) => invoke<void>("delete_profile", { id })
 
+// ---- 连接档案 导入/导出 ----
+export type ProfileFormat = "json" | "yaml" | "xml" | "csv" | "xlsx"
+export const PROFILE_FORMATS: ProfileFormat[] = ["json", "yaml", "xml", "csv", "xlsx"]
+export interface ExportOut {
+  filename: string
+  base64: boolean
+  content: string
+}
+export const exportProfiles = (format: ProfileFormat) => invoke<ExportOut>("export_profiles", { format })
+export const importProfiles = (format: ProfileFormat, dataBase64: string) =>
+  invoke<number>("import_profiles", { format, dataBase64 })
+
 // ---- MQTT 连接/订阅/发布 ----
 export const mqttConnect = (profile: Profile) => invoke<void>("mqtt_connect", { profile })
 export const mqttDisconnect = (connId: string) => invoke<void>("mqtt_disconnect", { connId })
@@ -98,8 +110,9 @@ export const chartRate = (connId: string, bucketMs: number, buckets: number) =>
   invoke<RatePoint[]>("chart_rate", { connId, bucketMs, buckets })
 export const chartContent = (connId: string, topicFilter: string, jsonpath: string, limit = 200) =>
   invoke<ContentPoint[]>("chart_content", { connId, topicFilter, jsonpath, limit })
-export const exportMessages = (connId: string, csv: boolean, format: Format) =>
-  invoke<string>("export_messages", { connId, csv, format })
+export type ExportKind = "csv" | "json" | "txt"
+export const exportMessages = (connId: string, kind: ExportKind, format: Format) =>
+  invoke<string>("export_messages", { connId, kind, format })
 export const scheduleStart = (
   connId: string,
   topic: string,

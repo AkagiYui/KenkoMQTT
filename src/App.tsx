@@ -1,8 +1,12 @@
 import { useEffect, useState } from "react"
-import { Moon, Sun, Github, Radio, Server, BatteryWarning, X } from "lucide-react"
+import { Moon, Sun, MoonStar, Github, Radio, Server, ScrollText, Settings as SettingsIcon, BatteryWarning, X, Languages, AppWindow } from "lucide-react"
 import { useTheme } from "@/lib/theme"
+import { useI18n } from "@/lib/i18n"
+import { pushLog } from "@/lib/log"
 import { ClientPage } from "@/pages/ClientPage"
 import { BrokerPage } from "@/pages/BrokerPage"
+import { LogPage } from "@/pages/LogPage"
+import { SettingsPage } from "@/pages/SettingsPage"
 import {
   type AndroidPerms,
   platformInfo,
@@ -14,29 +18,34 @@ import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { Toaster } from "@/components/ui/sonner"
 
-type Tab = "client" | "broker"
-
-const NAV: { key: Tab; label: string; icon: React.ReactNode }[] = [
-  { key: "client", label: "客户端", icon: <Radio className="size-4" /> },
-  { key: "broker", label: "Broker", icon: <Server className="size-4" /> },
-]
+type Tab = "client" | "broker" | "log" | "settings"
 
 export default function App() {
-  const { theme, toggle } = useTheme()
+  const { theme, toggle, setTheme } = useTheme()
+  const { t, lang, setLang } = useI18n()
   const [tab, setTab] = useState<Tab>("client")
   const [isAndroid, setIsAndroid] = useState(false)
+  const [isDesktop, setIsDesktop] = useState(true)
   const [perms, setPerms] = useState<AndroidPerms | null>(null)
   const [bannerDismissed, setBannerDismissed] = useState(false)
+
+  const NAV: { key: Tab; label: string; icon: React.ReactNode }[] = [
+    { key: "client", label: t("客户端"), icon: <Radio className="size-4" /> },
+    { key: "broker", label: t("Broker"), icon: <Server className="size-4" /> },
+    { key: "log", label: t("日志"), icon: <ScrollText className="size-4" /> },
+    { key: "settings", label: t("设置"), icon: <SettingsIcon className="size-4" /> },
+  ]
 
   useEffect(() => {
     platformInfo()
       .then((p) => {
         setIsAndroid(p.isAndroid)
+        setIsDesktop(!p.isAndroid && p.os !== "ios")
         if (p.isAndroid) checkAndroidPermissions().then(setPerms).catch(() => {})
       })
       .catch(() => {})
-    // broker 启停后重新检查权限（后台常驻依赖电池白名单）
-    const un = onBrokerStatus(() => {
+    const un = onBrokerStatus((running) => {
+      pushLog("info", "broker", running ? "broker started" : "broker stopped")
       checkAndroidPermissions().then(setPerms).catch(() => {})
     })
     return () => {
@@ -44,12 +53,58 @@ export default function App() {
     }
   }, [])
 
+  // 快捷键：Cmd/Ctrl+1..4 切换标签，Cmd/Ctrl+Shift+L 打开日志。
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey)) return
+      const map: Record<string, Tab> = { "1": "client", "2": "broker", "3": "log", "4": "settings" }
+      if (map[e.key]) {
+        e.preventDefault()
+        setTab(map[e.key])
+      } else if (e.shiftKey && e.key.toLowerCase() === "l") {
+        e.preventDefault()
+        setTab("log")
+      }
+    }
+    window.addEventListener("keydown", onKey)
+    return () => window.removeEventListener("keydown", onKey)
+  }, [])
+
+  async function openNewWindow() {
+    try {
+      const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow")
+      const label = `extra-${Date.now()}`
+      new WebviewWindow(label, { url: "index.html", title: "KenkoMQTT", width: 900, height: 720 })
+      pushLog("info", "app", `open window ${label}`)
+    } catch (e: any) {
+      pushLog("error", "app", `open window failed: ${String(e?.message ?? e)}`)
+    }
+  }
+
   const showBattery = isAndroid && perms?.applicable && !perms.ignoringBatteryOptimizations && !bannerDismissed
 
-  const themeBtn = (
-    <Button variant="ghost" size="icon" className="size-8" onClick={toggle} aria-label="切换主题">
-      {theme === "dark" ? <Sun className="size-4" /> : <Moon className="size-4" />}
-    </Button>
+  const themeIcon = theme === "light" ? <Moon className="size-4" /> : theme === "dark" ? <MoonStar className="size-4" /> : <Sun className="size-4" />
+
+  const controls = (
+    <>
+      <Button variant="ghost" size="icon" className="size-8" onClick={toggle} aria-label={t("切换主题")}>
+        {themeIcon}
+      </Button>
+      <Button
+        variant="ghost"
+        size="icon"
+        className="size-8"
+        onClick={() => setLang(lang === "zh" ? "en" : "zh")}
+        aria-label={t("切换语言")}
+      >
+        <Languages className="size-4" />
+      </Button>
+      {isDesktop && (
+        <Button variant="ghost" size="icon" className="size-8" onClick={openNewWindow} aria-label={t("新窗口")}>
+          <AppWindow className="size-4" />
+        </Button>
+      )}
+    </>
   )
 
   return (
@@ -73,7 +128,7 @@ export default function App() {
           ))}
         </nav>
         <div className="mt-auto flex items-center gap-1">
-          {themeBtn}
+          {controls}
           <Button
             variant="ghost"
             size="icon"
@@ -96,16 +151,17 @@ export default function App() {
                 key={n.key}
                 onClick={() => setTab(n.key)}
                 className={cn(
-                  "flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs transition-colors",
+                  "flex items-center gap-1.5 rounded-md px-2 py-1.5 text-xs transition-colors",
                   tab === n.key ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-muted"
                 )}
+                aria-label={n.label}
               >
                 {n.icon}
-                {n.label}
+                <span className="hidden sm:inline">{n.label}</span>
               </button>
             ))}
           </nav>
-          {themeBtn}
+          <div className="flex items-center">{controls}</div>
         </header>
 
         {/* Android 电池优化提示 */}
@@ -113,13 +169,13 @@ export default function App() {
           <div className="mx-3 mt-3 flex items-start gap-2 rounded-lg border border-warning/40 bg-warning/10 p-3 text-sm">
             <BatteryWarning className="mt-0.5 size-4 shrink-0 text-warning" />
             <div className="flex-1">
-              <p className="font-medium">建议关闭电池优化</p>
+              <p className="font-medium">{t("建议关闭电池优化")}</p>
               <p className="text-xs text-muted-foreground">
-                Android 后台限制可能在切后台时暂停 Broker/客户端连接。允许「无限制」后台运行可保持稳定。
+                {t("Android 后台限制可能在切后台时暂停 Broker/客户端连接。允许「无限制」后台运行可保持稳定。")}
               </p>
               <div className="mt-2 flex gap-2">
                 <Button size="sm" className="h-7 text-xs" onClick={() => openAndroidSettings("battery").catch(() => {})}>
-                  去设置
+                  {t("去设置")}
                 </Button>
                 <Button
                   size="sm"
@@ -127,17 +183,22 @@ export default function App() {
                   className="h-7 text-xs"
                   onClick={() => openAndroidSettings("appdetails").catch(() => {})}
                 >
-                  应用详情
+                  {t("应用详情")}
                 </Button>
               </div>
             </div>
-            <button onClick={() => setBannerDismissed(true)} aria-label="关闭" className="text-muted-foreground">
+            <button onClick={() => setBannerDismissed(true)} aria-label={t("关闭")} className="text-muted-foreground">
               <X className="size-4" />
             </button>
           </div>
         )}
 
-        <main>{tab === "client" ? <ClientPage /> : <BrokerPage />}</main>
+        <main>
+          {tab === "client" && <ClientPage />}
+          {tab === "broker" && <BrokerPage />}
+          {tab === "log" && <LogPage />}
+          {tab === "settings" && <SettingsPage theme={theme} setTheme={setTheme} />}
+        </main>
       </div>
 
       <Toaster />

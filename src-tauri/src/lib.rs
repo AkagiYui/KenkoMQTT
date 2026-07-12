@@ -3,6 +3,7 @@ mod broker;
 mod codec;
 mod model;
 mod mqtt;
+mod profiles_io;
 mod store;
 pub mod tls;
 
@@ -10,7 +11,7 @@ use android::{check_android_permissions, open_android_settings, platform_info};
 use broker::{BrokerConfig, BrokerState};
 use model::Profile;
 use mqtt::Manager;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager as _, State};
 
 // ---- 连接档案（JSON 持久化）----
 
@@ -35,6 +36,36 @@ fn delete_profile(app: AppHandle, id: String) -> Result<(), String> {
     let mut list = store::load(&app);
     list.retain(|p| p.id != id);
     store::save_all(&app, &list)
+}
+
+// ---- 连接档案 导入/导出（JSON / YAML / XML / CSV / XLSX）----
+
+#[tauri::command]
+fn export_profiles(app: AppHandle, format: String) -> Result<profiles_io::ExportOut, String> {
+    let list = store::load(&app);
+    profiles_io::export(&list, &format)
+}
+
+/// data_base64：前端把文件内容以 base64 传入（兼容二进制的 XLSX）。返回导入条数。
+#[tauri::command]
+fn import_profiles(app: AppHandle, format: String, data_base64: String) -> Result<usize, String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_base64.trim())
+        .map_err(|e| format!("base64 解码失败: {e}"))?;
+    let imported = profiles_io::import(&bytes, &format)?;
+    let mut list = store::load(&app);
+    let mut n = 0;
+    for mut p in imported {
+        // id 冲突则重新生成，避免覆盖既有连接。
+        if list.iter().any(|e| e.id == p.id) {
+            p.id = format!("{}-{}", p.id, mqtt::now_ms());
+        }
+        list.push(p);
+        n += 1;
+    }
+    store::save_all(&app, &list)?;
+    Ok(n)
 }
 
 // ---- MQTT ----
@@ -102,9 +133,10 @@ fn chart_content(mgr: State<'_, Manager>, conn_id: String, topic_filter: String,
     mgr.chart_content(&conn_id, topic_filter, jsonpath, limit.unwrap_or(200))
 }
 
+/// kind: "csv" | "json" | "txt"
 #[tauri::command]
-fn export_messages(mgr: State<'_, Manager>, conn_id: String, csv: bool, format: codec::Format) -> String {
-    mgr.export_messages(&conn_id, csv, format)
+fn export_messages(mgr: State<'_, Manager>, conn_id: String, kind: String, format: codec::Format) -> String {
+    mgr.export_messages(&conn_id, &kind, format)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -165,10 +197,26 @@ pub fn run() {
     tauri::Builder::default()
         .manage(Manager::default())
         .manage(BrokerState::default())
+        .setup(|app| {
+            // 消息落盘：注入 messages 目录并载入历史，随后每 3 秒把脏连接写盘。
+            let handle = app.handle().clone();
+            if let Ok(dir) = handle.path().app_data_dir() {
+                app.state::<Manager>().init_persistence(dir.join("messages"));
+            }
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    handle.state::<Manager>().flush();
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             list_profiles,
             save_profile,
             delete_profile,
+            export_profiles,
+            import_profiles,
             mqtt_connect,
             mqtt_disconnect,
             mqtt_subscribe,
