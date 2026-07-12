@@ -115,31 +115,68 @@ jobs:
         working-directory: ${{ env.APP_DIR }}
         run: pnpm tauri android init
 
-      - name: 构建 Android 生产 APK
+      - name: 构建 APK（universal + 分架构）
         working-directory: ${{ env.APP_DIR }}
-        run: pnpm tauri android build --apk
-
-      - name: 生成签名密钥并签名 APK
         run: |
-          set -e
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/unsigned"; mkdir -p "$STAGE"
+          # 1) universal（含全部 ABI）
+          pnpm tauri android build --apk
+          find src-tauri/gen/android -path '*release*' -name 'app-universal-release-unsigned.apk' -exec cp {} "$STAGE/" \;
+          # 2) 按 ABI 拆分（每架构一个小包）
+          pnpm tauri android build --apk --split-per-abi
+          find src-tauri/gen/android -path '*release*' -name 'app-*-release-unsigned.apk' ! -name 'app-universal-*' -exec cp {} "$STAGE/" \;
+          echo "待签名 APK："; ls -lh "$STAGE"
+
+      - name: 生成密钥并签名全部 APK
+        run: |
+          set -euo pipefail
           KS="$RUNNER_TEMP/ci.jks"
           keytool -genkeypair -v -keystore "$KS" -alias ci -keyalg RSA -keysize 2048 \
             -validity 3650 -storepass android -keypass android \
             -dname "CN=KenkoMQTT CI, O=KenkoMQTT"
           BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
-          UNSIGNED="$(find "$APP_DIR/src-tauri/gen/android" -path '*release*' -name '*-unsigned.apk' | head -1)"
-          echo "unsigned apk: $UNSIGNED"
-          test -n "$UNSIGNED"
-          "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --ks-key-alias ci \
-            --key-pass pass:android --out "$RUNNER_TEMP/kenkomqtt-android.apk" "$UNSIGNED"
-          "$BT/apksigner" verify "$RUNNER_TEMP/kenkomqtt-android.apk"
+          OUT="$RUNNER_TEMP/apks"; mkdir -p "$OUT"
+          for apk in "$RUNNER_TEMP"/unsigned/*.apk; do
+            # app-universal-release-unsigned.apk -> universal；app-arm64-v8a-release-unsigned.apk -> arm64-v8a
+            abi="$(basename "$apk" | sed -E 's/^app-(.*)-release-unsigned\.apk$/\1/')"
+            "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --ks-key-alias ci \
+              --key-pass pass:android --out "$OUT/kenkomqtt-$abi.apk" "$apk"
+            "$BT/apksigner" verify "$OUT/kenkomqtt-$abi.apk"
+            echo "已签名: $abi"
+          done
+          ls -lh "$OUT"
 
-      - name: 上传产物
+      - name: 上传 universal
         uses: actions/upload-artifact@v7
         with:
-          name: kenkomqtt-android
+          name: kenkomqtt-android-universal
           if-no-files-found: error
-          path: ${{ runner.temp }}/kenkomqtt-android.apk
+          path: ${{ runner.temp }}/apks/kenkomqtt-universal.apk
+      - name: 上传 arm64-v8a
+        uses: actions/upload-artifact@v7
+        with:
+          name: kenkomqtt-android-arm64-v8a
+          if-no-files-found: error
+          path: ${{ runner.temp }}/apks/kenkomqtt-arm64-v8a.apk
+      - name: 上传 armeabi-v7a
+        uses: actions/upload-artifact@v7
+        with:
+          name: kenkomqtt-android-armeabi-v7a
+          if-no-files-found: error
+          path: ${{ runner.temp }}/apks/kenkomqtt-armeabi-v7a.apk
+      - name: 上传 x86
+        uses: actions/upload-artifact@v7
+        with:
+          name: kenkomqtt-android-x86
+          if-no-files-found: error
+          path: ${{ runner.temp }}/apks/kenkomqtt-x86.apk
+      - name: 上传 x86_64
+        uses: actions/upload-artifact@v7
+        with:
+          name: kenkomqtt-android-x86_64
+          if-no-files-found: error
+          path: ${{ runner.temp }}/apks/kenkomqtt-x86_64.apk
 
   # ---------- iOS 构建（无签名：模拟器 .app）----------
   # 说明：Tauri 的 iOS 生产构建必须走 `tauri ios build`（原始 xcodebuild 会进 dev 路径、依赖 dev server）。
