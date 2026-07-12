@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react"
-import { Plus, Plug, Unplug, Trash2, Save, Copy, PlugZap, Settings2, Dices } from "lucide-react"
+import { useEffect, useState } from "react"
+import { Plug, Unplug, Trash2, Save, Copy, PlugZap, Settings2, Dices } from "lucide-react"
 import { toast } from "sonner"
 import {
   type Profile,
@@ -23,6 +23,7 @@ import { MessageViewer } from "@/components/MessageViewer"
 import { Analysis } from "@/components/Analysis"
 import { SubscriptionPanel } from "@/components/SubscriptionPanel"
 import { PublishPanel } from "@/components/PublishPanel"
+import { ConnectionTree } from "@/components/ConnectionTree"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -65,17 +66,6 @@ export function ClientPage() {
   const connId = form.id
   const status = statusMap[connId] ?? "disconnected"
   const connected = status === "connected"
-
-  // 按分组归类连接（空分组归入「未分组」）
-  const grouped = useMemo(() => {
-    const m = new Map<string, Profile[]>()
-    for (const p of profiles) {
-      const g = p.group?.trim() || ""
-      if (!m.has(g)) m.set(g, [])
-      m.get(g)!.push(p)
-    }
-    return [...m.entries()]
-  }, [profiles])
 
   useEffect(() => {
     loadProfiles()
@@ -196,35 +186,17 @@ export function ClientPage() {
 
   return (
     <div className="mx-auto flex max-w-4xl flex-col gap-3 p-3 lg:max-w-6xl">
-      {/* 连接选择（按分组） */}
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 pb-1">
-        {grouped.map(([g, list]) => (
-          <div key={g || "_"} className="flex items-center gap-1.5">
-            {g && <span className="text-[11px] font-medium text-muted-foreground">{g}:</span>}
-            {list.map((p) => {
-              const st = statusMap[p.id] ?? "disconnected"
-              return (
-                <button
-                  key={p.id}
-                  onClick={() => selectConnection(p)}
-                  onContextMenu={(e) => { e.preventDefault(); handleDuplicate(p) }}
-                  title={t("右键复制连接")}
-                  className={cn(
-                    "flex shrink-0 items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs transition-colors",
-                    form.id === p.id && !isDraft ? "border-primary bg-primary/10" : "border-border hover:bg-muted"
-                  )}
-                >
-                  <span className={cn("size-1.5 rounded-full", st === "connected" ? "bg-success" : st === "error" ? "bg-destructive" : "bg-muted-foreground")} />
-                  {p.name}
-                </button>
-              )
-            })}
-          </div>
-        ))}
-        <Button variant="outline" size="sm" className="h-7 shrink-0 gap-1 text-xs" onClick={newConnection}>
-          <Plus className="size-3.5" /> {t("新建")}
-        </Button>
-      </div>
+      {/* 连接树（分组 + 拖拽排序） */}
+      <ConnectionTree
+        profiles={profiles}
+        statusMap={statusMap}
+        selectedId={form.id}
+        isDraft={isDraft}
+        onSelect={selectConnection}
+        onDuplicate={handleDuplicate}
+        onNew={newConnection}
+        onReordered={loadProfiles}
+      />
 
       <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
         {/* 连接设置 */}

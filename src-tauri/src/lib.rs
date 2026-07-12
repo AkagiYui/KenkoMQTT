@@ -38,6 +38,27 @@ fn delete_profile(app: AppHandle, id: String) -> Result<(), String> {
     store::save_all(&app, &list)
 }
 
+/// 拖拽重排后更新连接的 sortOrder 与 group。
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OrderItem {
+    id: String,
+    sort_order: i32,
+    group: String,
+}
+
+#[tauri::command]
+fn reorder_profiles(app: AppHandle, items: Vec<OrderItem>) -> Result<(), String> {
+    let mut list = store::load(&app);
+    for it in &items {
+        if let Some(p) = list.iter_mut().find(|p| p.id == it.id) {
+            p.sort_order = it.sort_order;
+            p.group = it.group.clone();
+        }
+    }
+    store::save_all(&app, &list)
+}
+
 // ---- 连接档案 导入/导出（JSON / YAML / XML / CSV / XLSX）----
 
 #[tauri::command]
@@ -82,8 +103,8 @@ async fn mqtt_disconnect(mgr: State<'_, Manager>, conn_id: String) -> Result<(),
 
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
-async fn mqtt_subscribe(mgr: State<'_, Manager>, conn_id: String, topic: String, qos: u8, nl: Option<bool>, rap: Option<bool>, rh: Option<u8>) -> Result<(), String> {
-    mqtt::subscribe(mgr, conn_id, topic, qos, nl.unwrap_or(false), rap.unwrap_or(false), rh.unwrap_or(0)).await
+async fn mqtt_subscribe(mgr: State<'_, Manager>, conn_id: String, topic: String, qos: u8, nl: Option<bool>, rap: Option<bool>, rh: Option<u8>, sub_id: Option<u32>) -> Result<(), String> {
+    mqtt::subscribe(mgr, conn_id, topic, qos, nl.unwrap_or(false), rap.unwrap_or(false), rh.unwrap_or(0), sub_id).await
 }
 
 #[tauri::command]
@@ -128,6 +149,16 @@ fn messages_clear(mgr: State<'_, Manager>, conn_id: String) {
 #[tauri::command]
 fn messages_clear_topic(mgr: State<'_, Manager>, conn_id: String, topic_filter: String) {
     mgr.clear_topic(&conn_id, &topic_filter)
+}
+
+#[tauri::command]
+fn sub_counts(mgr: State<'_, Manager>, conn_id: String, filters: Vec<String>) -> Vec<u64> {
+    mgr.sub_counts(&conn_id, &filters)
+}
+
+#[tauri::command]
+fn dashboard_latest(mgr: State<'_, Manager>, conn_id: String, topic_filter: String, jsonpath: String) -> Result<mqtt::DashValue, String> {
+    mgr.dashboard_latest(&conn_id, &topic_filter, &jsonpath)
 }
 
 #[tauri::command]
@@ -237,6 +268,7 @@ pub fn run() {
             list_profiles,
             save_profile,
             delete_profile,
+            reorder_profiles,
             export_profiles,
             import_profiles,
             mqtt_connect,
@@ -248,6 +280,8 @@ pub fn run() {
             messages_query,
             messages_clear,
             messages_clear_topic,
+            sub_counts,
+            dashboard_latest,
             topic_tree,
             chart_rate,
             chart_traffic,

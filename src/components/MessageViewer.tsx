@@ -4,7 +4,7 @@ import {
   ChevronFirst, ChevronLast, ChevronLeft, ChevronRight, Braces, GitCompareArrows,
 } from "lucide-react"
 import {
-  type Format, type MsgRow, type QueryOpts, type SubProfile, FORMATS, messagesQuery, messagesClear, exportMessages, onMsgSignal,
+  type Format, type MsgRow, type QueryOpts, type SubProfile, type FormatOverride, FORMATS, subTopics, messagesQuery, messagesClear, exportMessages, onMsgSignal,
 } from "@/lib/api"
 import { lineDiff } from "@/lib/diff"
 import { useI18n } from "@/lib/i18n"
@@ -37,9 +37,9 @@ function download(name: string, text: string) {
   URL.revokeObjectURL(url)
 }
 
-// 按订阅（含通配符）匹配消息主题，返回其颜色 / 是否静音。
+// 按订阅（含通配符、多主题）匹配消息主题，返回其颜色 / 是否静音。
 function subFor(subs: SubProfile[], topic: string): SubProfile | undefined {
-  return subs.find((s) => topicMatches(s.topic, topic))
+  return subs.find((s) => subTopics(s).some((tp) => topicMatches(tp, topic)))
 }
 
 export function MessageViewer({ connId, name, subs = [] }: { connId: string; name: string; subs?: SubProfile[] }) {
@@ -73,6 +73,15 @@ export function MessageViewer({ connId, name, subs = [] }: { connId: string; nam
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const curPage = follow ? pageCount - 1 : Math.min(page, pageCount - 1)
 
+  // 每订阅独立格式 → 后端解码覆盖
+  const overrides: FormatOverride[] = useMemo(
+    () =>
+      subs
+        .filter((s) => s.format)
+        .flatMap((s) => subTopics(s).map((tp) => ({ filter: tp, format: s.format as Format }))),
+    [subs]
+  )
+
   const opts: QueryOpts = useMemo(
     () => ({
       format,
@@ -84,8 +93,9 @@ export function MessageViewer({ connId, name, subs = [] }: { connId: string; nam
       dir: dir === "all" ? null : dir,
       offset: curPage * PAGE_SIZE,
       limit: PAGE_SIZE,
+      overrides,
     }),
-    [format, search, regex, caseSensitive, wholeWord, ignoreQos0, dir, curPage]
+    [format, search, regex, caseSensitive, wholeWord, ignoreQos0, dir, curPage, overrides]
   )
 
   function refresh() {
@@ -109,7 +119,7 @@ export function MessageViewer({ connId, name, subs = [] }: { connId: string; nam
       })
       .catch(() => {})
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connId, format, search, regex, caseSensitive, wholeWord, ignoreQos0, dir, curPage])
+  }, [connId, format, search, regex, caseSensitive, wholeWord, ignoreQos0, dir, curPage, overrides])
 
   // 新消息信号：follow 时节流刷新
   useEffect(() => {

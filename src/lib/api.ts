@@ -23,17 +23,47 @@ export interface KeyVal {
 }
 
 export interface SubProfile {
-  topic: string
+  id: string
+  topic: string // 旧单主题（兼容）
+  topics: string[] // 新多主题（一条目多主题）
   qos: number
   color: string
   alias: string
   enabled: boolean
   muted: boolean
-  format: string
+  format: string // 空 = 跟随全局
   nl: boolean
   rap: boolean
   rh: number
+  subId?: number | null // MQTT5 Subscription Identifier
   favorite: boolean
+}
+
+/** 该订阅条目实际的主题集合（topics 优先，回退 topic）。 */
+export function subTopics(s: SubProfile): string[] {
+  const list = (s.topics && s.topics.length ? s.topics : s.topic ? [s.topic] : [])
+    .map((x) => x.trim())
+    .filter(Boolean)
+  return list
+}
+
+export function newSubProfile(): SubProfile {
+  return {
+    id: crypto.randomUUID(),
+    topic: "",
+    topics: [],
+    qos: 0,
+    color: "",
+    alias: "",
+    enabled: true,
+    muted: false,
+    format: "",
+    nl: false,
+    rap: false,
+    rh: 0,
+    subId: null,
+    favorite: false,
+  }
 }
 
 export interface Profile {
@@ -102,6 +132,12 @@ export interface MsgRow {
   props?: MsgProps
 }
 
+// 每订阅独立格式覆盖
+export interface FormatOverride {
+  filter: string
+  format: Format
+}
+
 // 消息分页查询选项（过滤/正则/大小写/全词/方向/忽略QoS0/分页均在后端完成）
 export interface QueryOpts {
   format: Format
@@ -113,6 +149,7 @@ export interface QueryOpts {
   dir?: "rx" | "tx" | null
   offset?: number
   limit?: number
+  overrides?: FormatOverride[]
 }
 export interface MsgPage {
   rows: MsgRow[]
@@ -154,6 +191,12 @@ export type LoadMethod = "count" | "avg" | "sum" | "max" | "min"
 export const listProfiles = () => invoke<Profile[]>("list_profiles")
 export const saveProfile = (profile: Profile) => invoke<Profile>("save_profile", { profile })
 export const deleteProfile = (id: string) => invoke<void>("delete_profile", { id })
+export interface OrderItem {
+  id: string
+  sortOrder: number
+  group: string
+}
+export const reorderProfiles = (items: OrderItem[]) => invoke<void>("reorder_profiles", { items })
 
 // ---- 连接档案 导入/导出 ----
 export type ProfileFormat = "json" | "yaml" | "xml" | "csv" | "xlsx"
@@ -176,8 +219,9 @@ export const mqttSubscribe = (
   qos: number,
   nl = false,
   rap = false,
-  rh = 0
-) => invoke<void>("mqtt_subscribe", { connId, topic, qos, nl, rap, rh })
+  rh = 0,
+  subId: number | null = null
+) => invoke<void>("mqtt_subscribe", { connId, topic, qos, nl, rap, rh, subId })
 export const mqttUnsubscribe = (connId: string, topic: string) =>
   invoke<void>("mqtt_unsubscribe", { connId, topic })
 export const mqttTestConnection = (profile: Profile) => invoke<void>("mqtt_test_connection", { profile })
@@ -208,6 +252,15 @@ export const messagesQuery = (connId: string, opts: QueryOpts) =>
 export const messagesClear = (connId: string) => invoke<void>("messages_clear", { connId })
 export const messagesClearTopic = (connId: string, topicFilter: string) =>
   invoke<void>("messages_clear_topic", { connId, topicFilter })
+export const subCounts = (connId: string, filters: string[]) =>
+  invoke<number[]>("sub_counts", { connId, filters })
+export interface DashValue {
+  num?: number
+  text?: string
+  ts: number
+}
+export const dashboardLatest = (connId: string, topicFilter: string, jsonpath: string) =>
+  invoke<DashValue>("dashboard_latest", { connId, topicFilter, jsonpath })
 export const topicTree = (connId: string, format: Format) => invoke<TreeNode[]>("topic_tree", { connId, format })
 export const chartRate = (connId: string, bucketMs: number, buckets: number) =>
   invoke<RatePoint[]>("chart_rate", { connId, bucketMs, buckets })

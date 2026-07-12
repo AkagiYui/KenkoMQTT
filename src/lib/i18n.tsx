@@ -160,6 +160,23 @@ const en: Record<string, string> = {
   已清除保留消息: "Retained message cleared",
   清除保留: "Clear retained",
   向该主题发布空保留消息以清除: "Publish empty retained to this topic to clear",
+  // 订阅增强
+  "订阅主题（多个用逗号/换行）": "Topics (comma/newline separated)",
+  默认格式: "Default format",
+  全订阅: "Sub all",
+  全部订阅: "Subscribe all",
+  已全部订阅: "All subscribed",
+  // 仪表盘
+  仪表盘: "Dashboard",
+  添加组件: "Add widget",
+  "暂无组件，点击「添加组件」": "No widgets — click Add widget",
+  类型: "Type",
+  标题: "Title",
+  "宽度(列)": "Width (cols)",
+  单位: "Unit",
+  添加: "Add",
+  // 连接树
+  未分组: "Ungrouped",
 }
 
 interface I18nCtx {

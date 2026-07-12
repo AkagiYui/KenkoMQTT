@@ -28,10 +28,19 @@ pub struct KeyVal {
 }
 
 /// 订阅档案（持久化 + 断线自动重订阅）。含 MQTT 5.0 订阅选项与展示属性。
+/// 支持「一条目多主题」：topics 非空则以之为准，否则回退到旧字段 topic。
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SubProfile {
+    /// 稳定主键（前端生成）。旧数据缺失时以第一个主题回填。
+    #[serde(default)]
+    pub id: String,
+    /// 旧的单主题字段（向后兼容）。
+    #[serde(default)]
     pub topic: String,
+    /// 新的多主题字段（一条目可含多个主题，共享下列选项）。
+    #[serde(default)]
+    pub topics: Vec<String>,
     pub qos: u8,
     #[serde(default)]
     pub color: String,
@@ -53,7 +62,23 @@ pub struct SubProfile {
     #[serde(default)]
     pub rh: u8, // Retain Handling 0/1/2
     #[serde(default)]
+    pub sub_id: Option<u32>, // Subscription Identifier
+    #[serde(default)]
     pub favorite: bool,
+}
+
+impl SubProfile {
+    /// 该条目实际订阅的主题集合（topics 优先，回退到 topic）。
+    pub fn effective_topics(&self) -> Vec<String> {
+        let list: Vec<String> = if !self.topics.is_empty() {
+            self.topics.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+        } else if !self.topic.trim().is_empty() {
+            vec![self.topic.trim().to_string()]
+        } else {
+            vec![]
+        };
+        list
+    }
 }
 
 /// 连接档案，持久化为 JSON。id 由前端生成（crypto.randomUUID）。

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { Moon, Sun, MoonStar, Github, Radio, Server, ScrollText, Settings as SettingsIcon, BatteryWarning, X, Languages, AppWindow } from "lucide-react"
+import { Moon, Sun, MoonStar, Github, Radio, Server, ScrollText, Settings as SettingsIcon, BatteryWarning, X, Languages, AppWindow, LayoutDashboard } from "lucide-react"
 import { useTheme } from "@/lib/theme"
 import { useI18n } from "@/lib/i18n"
 import { pushLog } from "@/lib/log"
@@ -7,6 +7,7 @@ import { ClientPage } from "@/pages/ClientPage"
 import { BrokerPage } from "@/pages/BrokerPage"
 import { LogPage } from "@/pages/LogPage"
 import { SettingsPage } from "@/pages/SettingsPage"
+import { DashboardPage } from "@/pages/DashboardPage"
 import {
   type AndroidPerms,
   platformInfo,
@@ -18,7 +19,7 @@ import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { Toaster } from "@/components/ui/sonner"
 
-type Tab = "client" | "broker" | "log" | "settings"
+type Tab = "client" | "broker" | "dashboard" | "log" | "settings"
 
 export default function App() {
   const { theme, toggle, setTheme } = useTheme()
@@ -32,6 +33,7 @@ export default function App() {
   const NAV: { key: Tab; label: string; icon: React.ReactNode }[] = [
     { key: "client", label: t("客户端"), icon: <Radio className="size-4" /> },
     { key: "broker", label: t("Broker"), icon: <Server className="size-4" /> },
+    { key: "dashboard", label: t("仪表盘"), icon: <LayoutDashboard className="size-4" /> },
     { key: "log", label: t("日志"), icon: <ScrollText className="size-4" /> },
     { key: "settings", label: t("设置"), icon: <SettingsIcon className="size-4" /> },
   ]
@@ -57,7 +59,7 @@ export default function App() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!(e.metaKey || e.ctrlKey)) return
-      const map: Record<string, Tab> = { "1": "client", "2": "broker", "3": "log", "4": "settings" }
+      const map: Record<string, Tab> = { "1": "client", "2": "broker", "3": "dashboard", "4": "log", "5": "settings" }
       if (map[e.key]) {
         e.preventDefault()
         setTab(map[e.key])
@@ -196,6 +198,7 @@ export default function App() {
         <main>
           {tab === "client" && <ClientPage />}
           {tab === "broker" && <BrokerPage />}
+          {tab === "dashboard" && <DashboardPage />}
           {tab === "log" && <LogPage />}
           {tab === "settings" && <SettingsPage theme={theme} setTheme={setTheme} />}
         </main>

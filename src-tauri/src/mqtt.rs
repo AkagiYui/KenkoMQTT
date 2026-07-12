@@ -30,6 +30,7 @@ struct SubRuntime {
     nl: bool,
     rap: bool,
     rh: u8,
+    sub_id: Option<u32>,
 }
 type SubMap = Arc<Mutex<HashMap<String, Vec<SubRuntime>>>>;
 
@@ -110,9 +111,19 @@ pub struct QueryOpts {
     pub offset: usize,
     #[serde(default = "default_limit")]
     pub limit: usize,
+    /// 每订阅独立格式：主题匹配时用指定格式解码（优先于 format）。
+    #[serde(default)]
+    pub overrides: Vec<FormatOverride>,
 }
 fn default_limit() -> usize {
     500
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FormatOverride {
+    pub filter: String,
+    pub format: Format,
 }
 
 #[derive(Serialize)]
@@ -177,6 +188,15 @@ pub struct RatePoint {
 pub struct ContentPoint {
     pub t: u64,
     pub v: f64,
+}
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DashValue {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    pub ts: u64,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -325,7 +345,7 @@ impl ClientKind {
         match self {
             ClientKind::V4(c) => c.subscribe(sub.topic.clone(), v4_qos(sub.qos)).await.map_err(|e| e.to_string()),
             ClientKind::V5(c) => {
-                use rumqttc::v5::mqttbytes::v5::{Filter, RetainForwardRule};
+                use rumqttc::v5::mqttbytes::v5::{Filter, RetainForwardRule, SubscribeProperties};
                 let mut f = Filter::new(sub.topic.clone(), v5_qos(sub.qos));
                 f.nolocal = sub.nl;
                 f.preserve_retain = sub.rap;
@@ -334,7 +354,13 @@ impl ClientKind {
                     2 => RetainForwardRule::Never,
                     _ => RetainForwardRule::OnEverySubscribe,
                 };
-                c.subscribe_many(vec![f]).await.map_err(|e| e.to_string())
+                match sub.sub_id {
+                    Some(id) if id > 0 => {
+                        let props = SubscribeProperties { id: Some(id as usize), user_properties: vec![] };
+                        c.subscribe_many_with_properties(vec![f], props).await.map_err(|e| e.to_string())
+                    }
+                    _ => c.subscribe_many(vec![f]).await.map_err(|e| e.to_string()),
+                }
             }
         }
     }
@@ -404,8 +430,15 @@ impl Manager {
         let Some(dq) = g.get(conn_id) else {
             return MsgPage { rows: vec![], total: 0 };
         };
-        let fmt = opts.format;
         let matcher = build_matcher(opts);
+        // 解析某条消息应使用的格式：命中订阅格式覆盖则用之，否则全局 format。
+        let fmt_for = |topic: &str| -> Format {
+            opts.overrides
+                .iter()
+                .find(|o| topic_matches(&o.filter, topic))
+                .map(|o| o.format)
+                .unwrap_or(opts.format)
+        };
         // 时间升序遍历，收集匹配项索引。
         let matched: Vec<&StoredMsg> = dq
             .iter()
@@ -419,7 +452,7 @@ impl Manager {
                     }
                 }
                 match &matcher {
-                    Some(f) => f(&m.topic, &codec::decode(&m.payload, fmt)),
+                    Some(f) => f(&m.topic, &codec::decode(&m.payload, fmt_for(&m.topic))),
                     None => true,
                 }
             })
@@ -432,7 +465,7 @@ impl Manager {
             .map(|m| MsgRow {
                 dir: m.dir.clone(),
                 topic: m.topic.clone(),
-                payload: codec::decode(&m.payload, fmt),
+                payload: codec::decode(&m.payload, fmt_for(&m.topic)),
                 size: m.payload.len(),
                 qos: m.qos,
                 retain: m.retain,
@@ -449,6 +482,44 @@ impl Manager {
         if let Some(p) = self.msg_file(conn_id) {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    /// 每个订阅过滤器匹配到的收到消息条数（用于订阅计数徽标）。
+    pub fn sub_counts(&self, conn_id: &str, filters: &[String]) -> Vec<u64> {
+        let g = self.store.lock().unwrap();
+        let Some(dq) = g.get(conn_id) else { return vec![0; filters.len()] };
+        filters
+            .iter()
+            .map(|f| dq.iter().filter(|m| m.dir == "rx" && topic_matches(f, &m.topic)).count() as u64)
+            .collect()
+    }
+
+    /// 仪表盘取值：匹配 topic 的最近一条消息，用 JSONPath 提取数值/文本。
+    pub fn dashboard_latest(&self, conn_id: &str, topic_filter: &str, jsonpath: &str) -> Result<DashValue, String> {
+        let g = self.store.lock().unwrap();
+        let Some(dq) = g.get(conn_id) else { return Ok(DashValue::default()) };
+        // 从最近往前找第一条匹配的消息。
+        let Some(m) = dq.iter().rev().find(|m| topic_filter.is_empty() || topic_matches(topic_filter, &m.topic)) else {
+            return Ok(DashValue::default());
+        };
+        let mut out = DashValue { ts: m.ts, ..Default::default() };
+        if jsonpath.trim().is_empty() {
+            let text = String::from_utf8_lossy(&m.payload).to_string();
+            out.num = text.trim().parse::<f64>().ok();
+            out.text = Some(text);
+            return Ok(out);
+        }
+        let path = JsonPath::parse(jsonpath).map_err(|e| e.to_string())?;
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&m.payload) {
+            if let Some(node) = path.query(&v).first() {
+                out.num = node.as_f64().or_else(|| node.as_str().and_then(|s| s.parse::<f64>().ok()));
+                out.text = Some(match node {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// 清空某连接下与 topic_filter（支持通配符）匹配的消息。
@@ -757,11 +828,16 @@ pub fn connect(app: AppHandle, mgr: &Manager, profile: Profile) -> Result<(), St
         base_id
     };
     // 用连接档案里的订阅初始化运行期订阅表（供首连与断线重连重放）。
+    // 一条目多主题：展开为每主题一条 SubRuntime，共享该条目的选项与 subId。
     let runtime_subs: Vec<SubRuntime> = profile
         .subscriptions
         .iter()
-        .filter(|s| s.enabled && !s.topic.trim().is_empty())
-        .map(|s| SubRuntime { topic: s.topic.clone(), qos: s.qos, nl: s.nl, rap: s.rap, rh: s.rh })
+        .filter(|s| s.enabled)
+        .flat_map(|s| {
+            s.effective_topics()
+                .into_iter()
+                .map(move |topic| SubRuntime { topic, qos: s.qos, nl: s.nl, rap: s.rap, rh: s.rh, sub_id: s.sub_id })
+        })
         .collect();
     mgr.subs.lock().unwrap().insert(conn_id.clone(), runtime_subs);
 
@@ -966,8 +1042,8 @@ pub async fn disconnect(mgr: State<'_, Manager>, conn_id: String) -> Result<(), 
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn subscribe(mgr: State<'_, Manager>, conn_id: String, topic: String, qos: u8, nl: bool, rap: bool, rh: u8) -> Result<(), String> {
-    let sub = SubRuntime { topic: topic.clone(), qos, nl, rap, rh };
+pub async fn subscribe(mgr: State<'_, Manager>, conn_id: String, topic: String, qos: u8, nl: bool, rap: bool, rh: u8, sub_id: Option<u32>) -> Result<(), String> {
+    let sub = SubRuntime { topic: topic.clone(), qos, nl, rap, rh, sub_id };
     // 更新运行期订阅表（去重），供断线重连重放。
     {
         let mut g = mgr.subs.lock().unwrap();
@@ -1269,6 +1345,50 @@ mod tests {
         assert_eq!(pts[0].v, 4.0);
         let pts = mgr.chart_load("c", "s/#", "count", 60_000, 1);
         assert_eq!(pts[0].v, 2.0);
+    }
+
+    #[test]
+    fn sub_counts_and_overrides() {
+        let mgr = Manager::default();
+        push(&mgr, "rx", "a/1", b"x", 0);
+        push(&mgr, "rx", "a/2", b"y", 0);
+        push(&mgr, "rx", "b/1", b"z", 0);
+        push(&mgr, "tx", "a/9", b"out", 0); // tx 不计入订阅计数
+        let counts = mgr.sub_counts("c", &["a/#".into(), "b/#".into(), "z/#".into()]);
+        assert_eq!(counts, vec![2, 1, 0]);
+
+        // 每订阅格式覆盖：hex 覆盖 a/#
+        push(&mgr, "rx", "a/hex", &[0xDE, 0xAD], 0);
+        let page = mgr.query(
+            "c",
+            &QueryOpts {
+                format: Format::Plaintext,
+                overrides: vec![FormatOverride { filter: "a/hex".into(), format: Format::Hex }],
+                limit: 100,
+                dir: Some("rx".into()),
+                ..Default::default()
+            },
+        );
+        let hex_row = page.rows.iter().find(|r| r.topic == "a/hex").unwrap();
+        assert_eq!(hex_row.payload, "dead");
+    }
+
+    #[test]
+    fn dashboard_latest_extracts_value() {
+        let mgr = Manager::default();
+        push(&mgr, "rx", "sensor/t", br#"{"value": 21.5}"#, 0);
+        push(&mgr, "rx", "sensor/t", br#"{"value": 23.0}"#, 0);
+        let v = mgr.dashboard_latest("c", "sensor/t", "$.value").unwrap();
+        assert_eq!(v.num, Some(23.0)); // 取最近一条
+    }
+
+    #[test]
+    fn effective_topics_prefers_topics() {
+        use crate::model::SubProfile;
+        let s = SubProfile { topic: "old".into(), topics: vec!["a".into(), "b".into()], ..Default::default() };
+        assert_eq!(s.effective_topics(), vec!["a", "b"]);
+        let s2 = SubProfile { topic: "old".into(), ..Default::default() };
+        assert_eq!(s2.effective_topics(), vec!["old"]);
     }
 
     #[test]
