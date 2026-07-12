@@ -11,19 +11,38 @@ env:
   APP_DIR: .
 
 jobs:
-  # ---------- 桌面端：Windows / macOS 生产包 ----------
+  # ---------- 桌面端：便携产物（macOS .app / Windows .exe，不打安装包） ----------
+  # macOS: universal / arm64 / intel(x86_64)，各出便携 .app；Windows: x64 / arm64 / x86，各出便携 .exe。
   desktop:
-    name: 构建桌面 (${{ matrix.os }})
+    name: 构建桌面 ${{ matrix.label }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
-            rust_target: aarch64-apple-darwin
-            artifact: kenkomqtt-macos
-          - os: windows-latest
-            rust_target: x86_64-pc-windows-msvc
-            artifact: kenkomqtt-windows
+          - label: macos-universal
+            os: macos-latest
+            target: universal-apple-darwin
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - label: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            rust_targets: aarch64-apple-darwin
+          - label: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            rust_targets: x86_64-apple-darwin
+          - label: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            rust_targets: x86_64-pc-windows-msvc
+          - label: windows-x86
+            os: windows-latest
+            target: i686-pc-windows-msvc
+            rust_targets: i686-pc-windows-msvc
+          - label: windows-arm64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            rust_targets: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -43,31 +62,51 @@ jobs:
       - name: 安装 Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.rust_target }}
+          targets: ${{ matrix.rust_targets }}
 
       - name: Rust 缓存
         uses: swatinem/rust-cache@v2
         with:
           workspaces: ${{ env.APP_DIR }}/src-tauri -> target
+          key: ${{ matrix.label }}
 
       - name: 安装前端依赖
         working-directory: ${{ env.APP_DIR }}
         run: pnpm install
 
-      - name: 构建 Tauri 生产包
+      - name: 构建便携产物（macOS 仅 .app / Windows 仅 .exe）
         working-directory: ${{ env.APP_DIR }}
-        run: pnpm tauri build --target ${{ matrix.rust_target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            pnpm tauri build --target ${{ matrix.target }} --bundles app
+          else
+            pnpm tauri build --target ${{ matrix.target }} --no-bundle
+          fi
+
+      - name: 收集便携产物
+        working-directory: ${{ env.APP_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/out"; mkdir -p "$OUT"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            APP="$(find "src-tauri/target/${{ matrix.target }}/release/bundle/macos" -maxdepth 1 -name '*.app' -type d | head -1)"
+            echo "app=$APP"; test -n "$APP"
+            ditto -c -k --sequesterRsrc --keepParent "$APP" "$OUT/KenkoMQTT-${{ matrix.label }}.app.zip"
+          else
+            EXE="$(find "src-tauri/target/${{ matrix.target }}/release" -maxdepth 1 -name '*.exe' | head -1)"
+            echo "exe=$EXE"; test -n "$EXE"
+            cp "$EXE" "$OUT/KenkoMQTT-${{ matrix.label }}.exe"
+          fi
 
       - name: 上传产物
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.artifact }}
+          name: kenkomqtt-${{ matrix.label }}
           if-no-files-found: error
-          path: |
-            ${{ env.APP_DIR }}/src-tauri/target/${{ matrix.rust_target }}/release/bundle/dmg/*.dmg
-            ${{ env.APP_DIR }}/src-tauri/target/${{ matrix.rust_target }}/release/bundle/macos/*.app
-            ${{ env.APP_DIR }}/src-tauri/target/${{ matrix.rust_target }}/release/bundle/msi/*.msi
-            ${{ env.APP_DIR }}/src-tauri/target/${{ matrix.rust_target }}/release/bundle/nsis/*.exe
+          path: ${{ runner.temp }}/out/*
 
   # ---------- Android 生产 APK ----------
   android:
