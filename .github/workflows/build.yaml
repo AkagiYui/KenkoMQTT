@@ -297,9 +297,13 @@ jobs:
         working-directory: ${{ env.APP_DIR }}
         run: |
           set -uo pipefail
-          pnpm tauri ios build --target aarch64 -- \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            DEVELOPMENT_TEAM="" PROVISIONING_PROFILE_SPECIFIER="" || true
+          GEN=src-tauri/gen/apple
+          # 在生成的 Xcode 工程目标里注入「关闭签名」，再重新生成工程
+          awk '{print} /LIBRARY_SEARCH_PATHS\[arch=arm64\]/{print "        CODE_SIGNING_ALLOWED: \"NO\""; print "        CODE_SIGNING_REQUIRED: \"NO\""; print "        CODE_SIGN_IDENTITY: \"\""}' \
+            "$GEN/project.yml" > "$GEN/project.yml.new" && mv "$GEN/project.yml.new" "$GEN/project.yml"
+          (cd "$GEN" && xcodegen generate)
+          # 生产路径构建(绕开 dev-server)；签名已关 → archive 未签名成功；export 无签名会失败，忽略
+          pnpm tauri ios build --target aarch64 || true
 
       - name: 打包未签名 .ipa
         working-directory: ${{ env.APP_DIR }}
