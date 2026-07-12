@@ -4,11 +4,11 @@ import {
   ChevronFirst, ChevronLast, ChevronLeft, ChevronRight, Braces, GitCompareArrows,
 } from "lucide-react"
 import {
-  type Format, type MsgRow, type QueryOpts, FORMATS, messagesQuery, messagesClear, exportMessages, onMsgSignal,
+  type Format, type MsgRow, type QueryOpts, type SubProfile, FORMATS, messagesQuery, messagesClear, exportMessages, onMsgSignal,
 } from "@/lib/api"
 import { lineDiff } from "@/lib/diff"
 import { useI18n } from "@/lib/i18n"
-import { cn, formatTime, formatBytes, tryPrettyJSON } from "@/lib/utils"
+import { cn, formatTime, formatBytes, tryPrettyJSON, topicMatches } from "@/lib/utils"
 import { JsonView } from "@/components/JsonView"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -37,7 +37,12 @@ function download(name: string, text: string) {
   URL.revokeObjectURL(url)
 }
 
-export function MessageViewer({ connId, name }: { connId: string; name: string }) {
+// 按订阅（含通配符）匹配消息主题，返回其颜色 / 是否静音。
+function subFor(subs: SubProfile[], topic: string): SubProfile | undefined {
+  return subs.find((s) => topicMatches(s.topic, topic))
+}
+
+export function MessageViewer({ connId, name, subs = [] }: { connId: string; name: string; subs?: SubProfile[] }) {
   const { t } = useI18n()
   const [format, setFormat] = useState<Format>("plaintext")
   const [search, setSearch] = useState("")
@@ -277,11 +282,17 @@ export function MessageViewer({ connId, name }: { connId: string; name: string }
 
         {/* 消息列表 */}
         <div ref={listRef} className="flex max-h-[45vh] flex-col gap-2 overflow-y-auto">
-          {rows.map((m, i) => {
+          {rows
+            .filter((m) => {
+              const s = subFor(subs, m.topic)
+              return !(s?.muted && m.dir === "rx") // 静音订阅隐藏其收到的消息
+            })
+            .map((m, i) => {
             const long = m.payload.length > COLLAPSE
             const isOpen = expanded.has(m.ts)
             const shown = long && !isOpen ? m.payload.slice(0, COLLAPSE) + "…" : m.payload
             const selectedForDiff = diffSel.some((r) => r.ts === m.ts && r.topic === m.topic)
+            const subColor = subFor(subs, m.topic)?.color
             return (
               <div
                 key={`${m.ts}-${i}`}
@@ -290,9 +301,10 @@ export function MessageViewer({ connId, name }: { connId: string; name: string }
                   e.preventDefault()
                   setMenu({ x: e.clientX, y: e.clientY, row: m })
                 }}
+                style={subColor ? { borderLeftColor: subColor } : undefined}
                 className={cn(
                   "rounded-md border-l-2 bg-muted/40 px-2.5 py-1.5",
-                  m.dir === "rx" ? "border-l-success" : "border-l-primary",
+                  !subColor && (m.dir === "rx" ? "border-l-success" : "border-l-primary"),
                   diffMode && "cursor-pointer",
                   selectedForDiff && "ring-1 ring-primary"
                 )}

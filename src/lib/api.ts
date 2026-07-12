@@ -10,6 +10,30 @@ export interface Will {
   payload: string
   qos: number
   retain: boolean
+  // MQTT 5.0 遗嘱属性
+  delayInterval?: number | null
+  messageExpiryInterval?: number | null
+  contentType?: string
+  responseTopic?: string
+}
+
+export interface KeyVal {
+  key: string
+  value: string
+}
+
+export interface SubProfile {
+  topic: string
+  qos: number
+  color: string
+  alias: string
+  enabled: boolean
+  muted: boolean
+  format: string
+  nl: boolean
+  rap: boolean
+  rh: number
+  favorite: boolean
 }
 
 export interface Profile {
@@ -27,8 +51,23 @@ export interface Profile {
   mqttVersion: number // 4 = 3.1.1, 5 = 5.0
   tlsSkipVerify: boolean
   caCert: string
+  clientCert: string
+  clientKey: string
+  alpn: string[]
   sortOrder: number
+  group: string
+  clientIdWithTime: boolean
+  autoReconnect: boolean
+  reconnectPeriodMs: number
+  connectTimeout: number
   will: Will
+  subscriptions: SubProfile[]
+  // MQTT 5.0 CONNECT 属性
+  sessionExpiryInterval?: number | null
+  receiveMaximum?: number | null
+  maximumPacketSize?: number | null
+  topicAliasMaximum?: number | null
+  userProperties: KeyVal[]
 }
 
 // 载荷格式（后端 codec）
@@ -131,10 +170,17 @@ export const importProfiles = (format: ProfileFormat, dataBase64: string) =>
 // ---- MQTT 连接/订阅/发布 ----
 export const mqttConnect = (profile: Profile) => invoke<void>("mqtt_connect", { profile })
 export const mqttDisconnect = (connId: string) => invoke<void>("mqtt_disconnect", { connId })
-export const mqttSubscribe = (connId: string, topic: string, qos: number) =>
-  invoke<void>("mqtt_subscribe", { connId, topic, qos })
+export const mqttSubscribe = (
+  connId: string,
+  topic: string,
+  qos: number,
+  nl = false,
+  rap = false,
+  rh = 0
+) => invoke<void>("mqtt_subscribe", { connId, topic, qos, nl, rap, rh })
 export const mqttUnsubscribe = (connId: string, topic: string) =>
   invoke<void>("mqtt_unsubscribe", { connId, topic })
+export const mqttTestConnection = (profile: Profile) => invoke<void>("mqtt_test_connection", { profile })
 export const mqttPublish = (
   connId: string,
   topic: string,
@@ -197,8 +243,18 @@ export function newProfile(): Profile {
     mqttVersion: 4,
     tlsSkipVerify: false,
     caCert: "",
+    clientCert: "",
+    clientKey: "",
+    alpn: [],
     sortOrder: 0,
+    group: "",
+    clientIdWithTime: false,
+    autoReconnect: true,
+    reconnectPeriodMs: 3000,
+    connectTimeout: 30,
     will: { enabled: false, topic: "", payload: "", qos: 0, retain: false },
+    subscriptions: [],
+    userProperties: [],
   }
 }
 

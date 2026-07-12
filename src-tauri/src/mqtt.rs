@@ -2,6 +2,7 @@
 //! 消息与计算均在后端：原始报文入库，按需做 过滤/格式解码/主题树/图表聚合/占位符/定时发布/导出。
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,6 +21,17 @@ enum ClientKind {
     V4(rumqttc::AsyncClient),
     V5(rumqttc::v5::AsyncClient),
 }
+
+/// 运行期订阅（用于断线自动重订阅）。
+#[derive(Clone)]
+struct SubRuntime {
+    topic: String,
+    qos: u8,
+    nl: bool,
+    rap: bool,
+    rh: u8,
+}
+type SubMap = Arc<Mutex<HashMap<String, Vec<SubRuntime>>>>;
 
 struct ConnHandle {
     client: ClientKind,
@@ -57,6 +69,8 @@ pub struct Manager {
     msg_dir: Mutex<Option<PathBuf>>,
     /// 自上次 flush 以来有新消息的连接（Arc 以便注入到各连接的事件循环任务）。
     dirty: Arc<Mutex<HashSet<String>>>,
+    /// 每连接当前订阅（断线重连时重放）。
+    subs: SubMap,
 }
 
 // ---- 前端展示用的序列化类型 ----
@@ -223,6 +237,21 @@ fn emit_status(app: &AppHandle, conn_id: &str, status: &str, detail: Option<Stri
     );
 }
 
+/// 连接超时看门狗：timeout 秒内未收到 ConnAck 则发出错误状态（提示性）。返回「已连接」标志供事件循环置位。
+fn spawn_connect_watchdog(app: &AppHandle, conn_id: &str, timeout_secs: u64) -> Arc<AtomicBool> {
+    let flag = Arc::new(AtomicBool::new(false));
+    let app = app.clone();
+    let id = conn_id.to_string();
+    let f = flag.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
+        if !f.load(Ordering::Relaxed) {
+            emit_status(&app, &id, "error", Some("连接超时".into()));
+        }
+    });
+    flag
+}
+
 /// 记录一条消息到后端库并向前端发出「有新消息」信号（前端据此按需重新查询）。
 fn record(store: &MsgLog, app: &AppHandle, conn_id: &str, dir: &'static str, topic: String, payload: Vec<u8>, qos: u8, retain: bool) {
     record_props(store, app, conn_id, dir, topic, payload, qos, retain, None);
@@ -258,10 +287,21 @@ fn record_mgr(mgr: &Manager, app: &AppHandle, conn_id: &str, dir: &'static str, 
 }
 
 impl ClientKind {
-    async fn subscribe(&self, topic: String, qos: u8) -> Result<(), String> {
+    async fn subscribe(&self, sub: &SubRuntime) -> Result<(), String> {
         match self {
-            ClientKind::V4(c) => c.subscribe(topic, v4_qos(qos)).await.map_err(|e| e.to_string()),
-            ClientKind::V5(c) => c.subscribe(topic, v5_qos(qos)).await.map_err(|e| e.to_string()),
+            ClientKind::V4(c) => c.subscribe(sub.topic.clone(), v4_qos(sub.qos)).await.map_err(|e| e.to_string()),
+            ClientKind::V5(c) => {
+                use rumqttc::v5::mqttbytes::v5::{Filter, RetainForwardRule};
+                let mut f = Filter::new(sub.topic.clone(), v5_qos(sub.qos));
+                f.nolocal = sub.nl;
+                f.preserve_retain = sub.rap;
+                f.retain_forward_rule = match sub.rh {
+                    1 => RetainForwardRule::OnNewSubscribe,
+                    2 => RetainForwardRule::Never,
+                    _ => RetainForwardRule::OnEverySubscribe,
+                };
+                c.subscribe_many(vec![f]).await.map_err(|e| e.to_string())
+            }
         }
     }
     async fn unsubscribe(&self, topic: String) -> Result<(), String> {
@@ -626,12 +666,12 @@ fn transport_for(p: &Profile) -> Result<(String, u16, rumqttc::Transport), Strin
     match p.protocol.as_str() {
         "tcp" => Ok((p.host.clone(), p.port, Transport::Tcp)),
         "tls" => {
-            let cfg = crate::tls::client_config(p.tls_skip_verify, &p.ca_cert);
+            let cfg = crate::tls::client_config(p.tls_skip_verify, &p.ca_cert, &p.client_cert, &p.client_key, &p.alpn);
             Ok((p.host.clone(), p.port, Transport::Tls(TlsConfiguration::Rustls(cfg))))
         }
         "ws" => Ok((format!("ws://{}:{}{}", p.host, p.port, norm_path(&p.path)), p.port, Transport::Ws)),
         "wss" => {
-            let cfg = crate::tls::client_config(p.tls_skip_verify, &p.ca_cert);
+            let cfg = crate::tls::client_config(p.tls_skip_verify, &p.ca_cert, &p.client_cert, &p.client_key, &p.alpn);
             Ok((
                 format!("wss://{}:{}{}", p.host, p.port, norm_path(&p.path)),
                 p.port,
@@ -649,16 +689,38 @@ pub fn connect(app: AppHandle, mgr: &Manager, profile: Profile) -> Result<(), St
         tauri::async_runtime::spawn(async move { c.disconnect().await });
     }
     let conn_id = profile.id.clone();
-    let client_id = if profile.client_id.trim().is_empty() {
+    let base_id = if profile.client_id.trim().is_empty() {
         format!("kenko-{}", now_ms())
     } else {
         profile.client_id.clone()
     };
+    let client_id = if profile.client_id_with_time && !profile.client_id.trim().is_empty() {
+        format!("{base_id}-{}", now_ms())
+    } else {
+        base_id
+    };
+    // 用连接档案里的订阅初始化运行期订阅表（供首连与断线重连重放）。
+    let runtime_subs: Vec<SubRuntime> = profile
+        .subscriptions
+        .iter()
+        .filter(|s| s.enabled && !s.topic.trim().is_empty())
+        .map(|s| SubRuntime { topic: s.topic.clone(), qos: s.qos, nl: s.nl, rap: s.rap, rh: s.rh })
+        .collect();
+    mgr.subs.lock().unwrap().insert(conn_id.clone(), runtime_subs);
+
     let (addr, port, transport) = transport_for(&profile)?;
     if profile.mqtt_version == 5 {
         connect_v5(app, mgr, &conn_id, &client_id, &profile, addr, port, transport)
     } else {
         connect_v4(app, mgr, &conn_id, &client_id, &profile, addr, port, transport)
+    }
+}
+
+/// 断线重连时/首连成功后重放订阅。
+async fn resubscribe(client: &ClientKind, subs: &SubMap, conn_id: &str) {
+    let list = subs.lock().unwrap().get(conn_id).cloned().unwrap_or_default();
+    for s in list {
+        let _ = client.subscribe(&s).await;
     }
 }
 
@@ -676,23 +738,37 @@ fn connect_v4(app: AppHandle, mgr: &Manager, conn_id: &str, client_id: &str, p: 
         opts.set_last_will(rumqttc::LastWill::new(&p.will.topic, p.will.payload.clone().into_bytes(), v4_qos(p.will.qos), p.will.retain));
     }
     let (client, mut eventloop) = AsyncClient::new(opts, 64);
+    let ck = ClientKind::V4(client.clone());
     let app2 = app.clone();
     let id = conn_id.to_string();
     let store = mgr.store.clone();
     let dirty = mgr.dirty.clone();
+    let subs = mgr.subs.clone();
+    let auto = p.auto_reconnect;
+    let period = p.reconnect_period_ms.max(500);
+    let connected_flag = spawn_connect_watchdog(&app2, &id, p.connect_timeout.max(1));
     let task = tauri::async_runtime::spawn(async move {
         emit_status(&app2, &id, "connecting", None);
         loop {
             match eventloop.poll().await {
-                Ok(Event::Incoming(Packet::ConnAck(_))) => emit_status(&app2, &id, "connected", None),
+                Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                    connected_flag.store(true, Ordering::Relaxed);
+                    emit_status(&app2, &id, "connected", None);
+                    resubscribe(&ck, &subs, &id).await;
+                }
                 Ok(Event::Incoming(Packet::Publish(pkt))) => {
                     record(&store, &app2, &id, "rx", pkt.topic.clone(), pkt.payload.to_vec(), pkt.qos as u8, pkt.retain);
                     dirty.lock().unwrap().insert(id.clone());
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    emit_status(&app2, &id, "error", Some(e.to_string()));
-                    break;
+                    if auto {
+                        emit_status(&app2, &id, "reconnecting", Some(e.to_string()));
+                        tokio::time::sleep(Duration::from_millis(period)).await;
+                    } else {
+                        emit_status(&app2, &id, "error", Some(e.to_string()));
+                        break;
+                    }
                 }
             }
         }
@@ -741,28 +817,57 @@ fn v5_publish_props_json(props: &rumqttc::v5::mqttbytes::v5::PublishProperties) 
 
 #[allow(clippy::too_many_arguments)]
 fn connect_v5(app: AppHandle, mgr: &Manager, conn_id: &str, client_id: &str, p: &Profile, addr: String, port: u16, transport: rumqttc::Transport) -> Result<(), String> {
-    use rumqttc::v5::mqttbytes::v5::Packet;
+    use rumqttc::v5::mqttbytes::v5::{ConnectProperties, LastWill, LastWillProperties, Packet};
     use rumqttc::v5::{AsyncClient, Event, MqttOptions};
     let mut opts = MqttOptions::new(client_id, addr, port);
     opts.set_transport(transport);
     opts.set_keep_alive(Duration::from_secs(p.keep_alive.max(5)));
     opts.set_clean_start(p.clean_session);
+    opts.set_connection_timeout(p.connect_timeout.max(1));
     if !p.username.is_empty() {
         opts.set_credentials(p.username.clone(), p.password.clone());
     }
+    // MQTT 5.0 CONNECT 属性
+    let mut cp = ConnectProperties::new();
+    cp.session_expiry_interval = p.session_expiry_interval;
+    cp.receive_maximum = p.receive_maximum;
+    cp.max_packet_size = p.maximum_packet_size;
+    cp.topic_alias_max = p.topic_alias_maximum;
+    cp.user_properties = p.user_properties.iter().map(|kv| (kv.key.clone(), kv.value.clone())).collect();
+    opts.set_connect_properties(cp);
     if p.will.enabled && !p.will.topic.is_empty() {
-        opts.set_last_will(rumqttc::v5::mqttbytes::v5::LastWill::new(&p.will.topic, p.will.payload.clone().into_bytes(), v5_qos(p.will.qos), p.will.retain, None));
+        let w = &p.will;
+        let has_props = w.delay_interval.is_some() || w.message_expiry_interval.is_some() || !w.content_type.is_empty() || !w.response_topic.is_empty();
+        let wprops = has_props.then(|| LastWillProperties {
+            delay_interval: w.delay_interval,
+            payload_format_indicator: None,
+            message_expiry_interval: w.message_expiry_interval,
+            content_type: (!w.content_type.is_empty()).then(|| w.content_type.clone()),
+            response_topic: (!w.response_topic.is_empty()).then(|| w.response_topic.clone()),
+            correlation_data: None,
+            user_properties: vec![],
+        });
+        opts.set_last_will(LastWill::new(&w.topic, w.payload.clone().into_bytes(), v5_qos(w.qos), w.retain, wprops));
     }
     let (client, mut eventloop) = AsyncClient::new(opts, 64);
+    let ck = ClientKind::V5(client.clone());
     let app2 = app.clone();
     let id = conn_id.to_string();
     let store = mgr.store.clone();
     let dirty = mgr.dirty.clone();
+    let subs = mgr.subs.clone();
+    let auto = p.auto_reconnect;
+    let period = p.reconnect_period_ms.max(500);
+    let connected_flag = spawn_connect_watchdog(&app2, &id, p.connect_timeout.max(1));
     let task = tauri::async_runtime::spawn(async move {
         emit_status(&app2, &id, "connecting", None);
         loop {
             match eventloop.poll().await {
-                Ok(Event::Incoming(Packet::ConnAck(_))) => emit_status(&app2, &id, "connected", None),
+                Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                    connected_flag.store(true, Ordering::Relaxed);
+                    emit_status(&app2, &id, "connected", None);
+                    resubscribe(&ck, &subs, &id).await;
+                }
                 Ok(Event::Incoming(Packet::Publish(pkt))) => {
                     let props = pkt.properties.as_ref().map(v5_publish_props_json);
                     record_props(
@@ -780,8 +885,13 @@ fn connect_v5(app: AppHandle, mgr: &Manager, conn_id: &str, client_id: &str, p: 
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    emit_status(&app2, &id, "error", Some(e.to_string()));
-                    break;
+                    if auto {
+                        emit_status(&app2, &id, "reconnecting", Some(e.to_string()));
+                        tokio::time::sleep(Duration::from_millis(period)).await;
+                    } else {
+                        emit_status(&app2, &id, "error", Some(e.to_string()));
+                        break;
+                    }
                 }
             }
         }
@@ -798,14 +908,84 @@ pub async fn disconnect(mgr: State<'_, Manager>, conn_id: String) -> Result<(), 
     Ok(())
 }
 
-pub async fn subscribe(mgr: State<'_, Manager>, conn_id: String, topic: String, qos: u8) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+pub async fn subscribe(mgr: State<'_, Manager>, conn_id: String, topic: String, qos: u8, nl: bool, rap: bool, rh: u8) -> Result<(), String> {
+    let sub = SubRuntime { topic: topic.clone(), qos, nl, rap, rh };
+    // 更新运行期订阅表（去重），供断线重连重放。
+    {
+        let mut g = mgr.subs.lock().unwrap();
+        let list = g.entry(conn_id.clone()).or_default();
+        list.retain(|s| s.topic != topic);
+        list.push(sub.clone());
+    }
     let c = mgr.client_of(&conn_id).ok_or("未连接")?;
-    c.subscribe(topic, qos).await
+    c.subscribe(&sub).await
 }
 
 pub async fn unsubscribe(mgr: State<'_, Manager>, conn_id: String, topic: String) -> Result<(), String> {
+    if let Some(list) = mgr.subs.lock().unwrap().get_mut(&conn_id) {
+        list.retain(|s| s.topic != topic);
+    }
     let c = mgr.client_of(&conn_id).ok_or("未连接")?;
     c.unsubscribe(topic).await
+}
+
+/// 测试连接：临时连一次，等待 ConnAck 或错误/超时。不入库、不保留。
+pub async fn test_connection(profile: Profile) -> Result<(), String> {
+    let (addr, port, transport) = transport_for(&profile)?;
+    let timeout = Duration::from_secs(profile.connect_timeout.max(1).min(30));
+    let client_id = if profile.client_id.trim().is_empty() { format!("kenko-test-{}", now_ms()) } else { profile.client_id.clone() };
+    if profile.mqtt_version == 5 {
+        use rumqttc::v5::mqttbytes::v5::Packet;
+        use rumqttc::v5::{AsyncClient, Event, MqttOptions};
+        let mut opts = MqttOptions::new(client_id, addr, port);
+        opts.set_transport(transport);
+        opts.set_keep_alive(Duration::from_secs(5));
+        opts.set_connection_timeout(profile.connect_timeout.max(1).min(30));
+        if !profile.username.is_empty() {
+            opts.set_credentials(profile.username.clone(), profile.password.clone());
+        }
+        let (client, mut eventloop) = AsyncClient::new(opts, 8);
+        let res = tokio::time::timeout(timeout, async {
+            loop {
+                match eventloop.poll().await {
+                    Ok(Event::Incoming(Packet::ConnAck(_))) => return Ok(()),
+                    Ok(_) => {}
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+        })
+        .await;
+        let _ = client.disconnect().await;
+        match res {
+            Ok(r) => r,
+            Err(_) => Err("连接超时".into()),
+        }
+    } else {
+        use rumqttc::{AsyncClient, Event, MqttOptions, Packet};
+        let mut opts = MqttOptions::new(client_id, addr, port);
+        opts.set_transport(transport);
+        opts.set_keep_alive(Duration::from_secs(5));
+        if !profile.username.is_empty() {
+            opts.set_credentials(profile.username.clone(), profile.password.clone());
+        }
+        let (client, mut eventloop) = AsyncClient::new(opts, 8);
+        let res = tokio::time::timeout(timeout, async {
+            loop {
+                match eventloop.poll().await {
+                    Ok(Event::Incoming(Packet::ConnAck(_))) => return Ok(()),
+                    Ok(_) => {}
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+        })
+        .await;
+        let _ = client.disconnect().await;
+        match res {
+            Ok(r) => r,
+            Err(_) => Err("连接超时".into()),
+        }
+    }
 }
 
 /// 发布（含格式编码与占位符展开），并把发出的报文记入库。

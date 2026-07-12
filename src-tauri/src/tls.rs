@@ -43,29 +43,70 @@ impl ServerCertVerifier for NoVerifier {
     }
 }
 
-pub fn client_config(skip_verify: bool, ca_pem: &str) -> Arc<ClientConfig> {
+/// 解析客户端证书链与私钥（双向 TLS）。任一为空返回 None。
+fn client_auth(cert_pem: &str, key_pem: &str) -> Option<(Vec<CertificateDer<'static>>, rustls::pki_types::PrivateKeyDer<'static>)> {
+    if cert_pem.trim().is_empty() || key_pem.trim().is_empty() {
+        return None;
+    }
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_bytes()).flatten().collect();
+    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes()).ok().flatten()?;
+    if certs.is_empty() {
+        return None;
+    }
+    Some((certs, key))
+}
+
+fn base_builder() -> rustls::ConfigBuilder<ClientConfig, rustls::client::WantsClientCert> {
     // 显式指定 ring provider，避免依赖“进程级默认 CryptoProvider 已安装”。
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let builder = ClientConfig::builder_with_provider(provider)
+    rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
-        .expect("rustls 默认协议版本");
+        .expect("rustls 默认协议版本")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifier))
+}
 
-    if skip_verify {
-        return Arc::new(
-            builder
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerifier))
-                .with_no_client_auth(),
-        );
-    }
+pub fn client_config(skip_verify: bool, ca_pem: &str, client_cert: &str, client_key: &str, alpn: &[String]) -> Arc<ClientConfig> {
+    let auth = client_auth(client_cert, client_key);
 
-    let mut roots = RootCertStore::empty();
-    if !ca_pem.trim().is_empty() {
-        for cert in rustls_pemfile::certs(&mut ca_pem.as_bytes()).flatten() {
-            let _ = roots.add(cert);
+    // 分别构造「跳过校验」与「校验」两条路径的 WantsClientCert 构建器。
+    let mut config: ClientConfig = if skip_verify {
+        let b = base_builder();
+        match auth {
+            Some((certs, key)) => b.with_client_auth_cert(certs, key).unwrap_or_else(|_| base_builder().with_no_client_auth()),
+            None => b.with_no_client_auth(),
         }
     } else {
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mk_roots = || {
+            let mut roots = RootCertStore::empty();
+            if !ca_pem.trim().is_empty() {
+                for cert in rustls_pemfile::certs(&mut ca_pem.as_bytes()).flatten() {
+                    let _ = roots.add(cert);
+                }
+            } else {
+                roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            }
+            roots
+        };
+        let b = ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .expect("rustls")
+            .with_root_certificates(mk_roots());
+        match auth {
+            Some((certs, key)) => b.with_client_auth_cert(certs, key).unwrap_or_else(|_| {
+                ClientConfig::builder_with_provider(provider)
+                    .with_safe_default_protocol_versions()
+                    .expect("rustls")
+                    .with_root_certificates(mk_roots())
+                    .with_no_client_auth()
+            }),
+            None => b.with_no_client_auth(),
+        }
+    };
+
+    if !alpn.is_empty() {
+        config.alpn_protocols = alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
     }
-    Arc::new(builder.with_root_certificates(roots).with_no_client_auth())
+    Arc::new(config)
 }

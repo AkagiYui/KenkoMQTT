@@ -39,6 +39,21 @@ export function formatBytes(bytes: number): string {
   return `${v.toFixed(1)} ${units[i]}`
 }
 
+/** MQTT 主题过滤器匹配（支持 + 与 #）。 */
+export function topicMatches(filter: string, topic: string): boolean {
+  const f = filter.split("/")
+  const t = topic.split("/")
+  for (let i = 0; i < f.length; i++) {
+    if (f[i] === "#") return true
+    if (f[i] === "+") {
+      if (i >= t.length) return false
+      continue
+    }
+    if (i >= t.length || t[i] !== f[i]) return false
+  }
+  return f.length === t.length
+}
+
 /** 若字符串是 JSON，返回美化后的文本，否则原样返回。 */
 export function tryPrettyJSON(text: string): string {
   const trimmed = text.trim()

@@ -80,9 +80,15 @@ async fn mqtt_disconnect(mgr: State<'_, Manager>, conn_id: String) -> Result<(),
     mqtt::disconnect(mgr, conn_id).await
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
-async fn mqtt_subscribe(mgr: State<'_, Manager>, conn_id: String, topic: String, qos: u8) -> Result<(), String> {
-    mqtt::subscribe(mgr, conn_id, topic, qos).await
+async fn mqtt_subscribe(mgr: State<'_, Manager>, conn_id: String, topic: String, qos: u8, nl: Option<bool>, rap: Option<bool>, rh: Option<u8>) -> Result<(), String> {
+    mqtt::subscribe(mgr, conn_id, topic, qos, nl.unwrap_or(false), rap.unwrap_or(false), rh.unwrap_or(0)).await
+}
+
+#[tauri::command]
+async fn mqtt_test_connection(profile: Profile) -> Result<(), String> {
+    mqtt::test_connection(profile).await
 }
 
 #[tauri::command]
@@ -236,6 +242,7 @@ pub fn run() {
             mqtt_disconnect,
             mqtt_subscribe,
             mqtt_unsubscribe,
+            mqtt_test_connection,
             mqtt_publish,
             messages_query,
             messages_clear,

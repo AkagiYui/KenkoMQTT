@@ -126,6 +126,31 @@ const en: Record<string, string> = {
   定时: "Timer",
   停止: "Stop",
   开始: "Start",
+  // 订阅面板 (二)
+  该主题已订阅: "Topic already subscribed",
+  "别名（可选）": "Alias (optional)",
+  "MQTT5 选项": "MQTT5 options",
+  无颜色: "No color",
+  收藏: "Favorite",
+  静音: "Mute",
+  "启用/停用": "Enable/disable",
+  退订: "Unsubscribe",
+  // 连接高级 (一)
+  连接测试成功: "Connection test OK",
+  连接测试失败: "Connection test failed",
+  已复制连接: "Connection duplicated",
+  右键复制连接: "Right-click to duplicate",
+  高级: "Advanced",
+  分组: "Group",
+  "连接超时(s)": "Connect timeout (s)",
+  "重连间隔(ms)": "Reconnect interval (ms)",
+  自动重连: "Auto reconnect",
+  "ClientId 追加时间戳": "Append timestamp to ClientId",
+  "随机 ClientId": "Random ClientId",
+  "客户端证书 (PEM，双向 TLS)": "Client cert (PEM, mutual TLS)",
+  "客户端私钥 (PEM)": "Client key (PEM)",
+  "会话过期(s)": "Session expiry (s)",
+  测试: "Test",
 }
 
 interface I18nCtx {

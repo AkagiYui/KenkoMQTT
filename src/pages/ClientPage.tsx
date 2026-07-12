@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react"
-import { Plus, Plug, Unplug, Trash2, Send, Save, X, Timer } from "lucide-react"
+import { useEffect, useMemo, useState } from "react"
+import { Plus, Plug, Unplug, Trash2, Send, Save, Timer, Copy, PlugZap, Settings2, Dices } from "lucide-react"
 import { toast } from "sonner"
 import {
   type Profile,
+  type SubProfile,
   type Protocol,
   type Status,
   type Format,
@@ -12,9 +13,8 @@ import {
   deleteProfile,
   mqttConnect,
   mqttDisconnect,
-  mqttSubscribe,
-  mqttUnsubscribe,
   mqttPublish,
+  mqttTestConnection,
   scheduleStart,
   scheduleStop,
   onStatus,
@@ -26,6 +26,7 @@ import { pushLog } from "@/lib/log"
 import { useI18n } from "@/lib/i18n"
 import { MessageViewer } from "@/components/MessageViewer"
 import { Analysis } from "@/components/Analysis"
+import { SubscriptionPanel } from "@/components/SubscriptionPanel"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -34,8 +35,6 @@ import { Badge } from "@/components/ui/badge"
 import { Textarea } from "@/components/ui/textarea"
 import { Card, CardContent } from "@/components/ui/card"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-
-type Sub = { topic: string; qos: number }
 
 const statusMeta: Record<Status, { label: string; variant: "success" | "secondary" | "warning" | "destructive" }> = {
   connected: { label: "已连接", variant: "success" },
@@ -77,10 +76,9 @@ export function ClientPage() {
   const [form, setForm] = useState<Profile>(newProfile())
   const [isDraft, setIsDraft] = useState(true)
   const [statusMap, setStatusMap] = useState<Record<string, Status>>({})
-  const [subsMap, setSubsMap] = useState<Record<string, Sub[]>>({})
+  const [showAdvanced, setShowAdvanced] = useState(false)
+  const [testing, setTesting] = useState(false)
 
-  const [subTopic, setSubTopic] = useState("#")
-  const [subQos, setSubQos] = useState(0)
   const [pubTopic, setPubTopic] = useState("test/topic")
   const [pubPayload, setPubPayload] = useState('{\n  "value": ${int(0,100)}\n}')
   const [pubQos, setPubQos] = useState(0)
@@ -93,7 +91,17 @@ export function ClientPage() {
   const connId = form.id
   const status = statusMap[connId] ?? "disconnected"
   const connected = status === "connected"
-  const subs = subsMap[connId] ?? []
+
+  // 按分组归类连接（空分组归入「未分组」）
+  const grouped = useMemo(() => {
+    const m = new Map<string, Profile[]>()
+    for (const p of profiles) {
+      const g = p.group?.trim() || ""
+      if (!m.has(g)) m.set(g, [])
+      m.get(g)!.push(p)
+    }
+    return [...m.entries()]
+  }, [profiles])
 
   useEffect(() => {
     loadProfiles()
@@ -180,22 +188,33 @@ export function ClientPage() {
     await mqttDisconnect(connId)
     setStatusMap((prev) => ({ ...prev, [connId]: "disconnected" }))
   }
-  async function handleSubscribe() {
-    if (!connected || !subTopic.trim()) return
+  // 订阅列表变更：更新表单并（非草稿时）持久化到档案。
+  function handleSubsChange(subscriptions: SubProfile[]) {
+    const next = { ...form, subscriptions }
+    setForm(next)
+    if (!isDraft) saveProfile(next).then(() => loadProfiles()).catch(() => {})
+  }
+  async function handleTest() {
+    setTesting(true)
     try {
-      await mqttSubscribe(connId, subTopic, subQos)
-      setSubsMap((prev) => {
-        const cur = prev[connId] ?? []
-        if (cur.some((s) => s.topic === subTopic)) return prev
-        return { ...prev, [connId]: [...cur, { topic: subTopic, qos: subQos }] }
-      })
+      await mqttTestConnection(form)
+      toast.success(t("连接测试成功"))
+      pushLog("info", "mqtt", `test ${form.host}:${form.port} ok`)
     } catch (e: any) {
-      toast.error(t("订阅失败"), { description: String(e?.message ?? e) })
+      toast.error(t("连接测试失败"), { description: String(e?.message ?? e) })
+      pushLog("error", "mqtt", `test failed: ${String(e?.message ?? e)}`)
+    } finally {
+      setTesting(false)
     }
   }
-  async function handleUnsubscribe(topic: string) {
-    await mqttUnsubscribe(connId, topic).catch(() => {})
-    setSubsMap((prev) => ({ ...prev, [connId]: (prev[connId] ?? []).filter((s) => s.topic !== topic) }))
+  async function handleDuplicate(p: Profile) {
+    const copy: Profile = { ...structuredClone(p), id: crypto.randomUUID(), name: `${p.name} (副本)` }
+    await saveProfile(copy)
+    await loadProfiles(copy.id)
+    toast.success(t("已复制连接"))
+  }
+  function randomClientId() {
+    patch({ clientId: `kenko-${Math.random().toString(36).slice(2, 10)}` })
   }
   async function handlePublish() {
     if (!connected || !pubTopic.trim()) return
@@ -226,24 +245,31 @@ export function ClientPage() {
 
   return (
     <div className="mx-auto flex max-w-4xl flex-col gap-3 p-3 lg:max-w-6xl">
-      {/* 连接选择 */}
-      <div className="flex items-center gap-2 overflow-x-auto pb-1">
-        {profiles.map((p) => {
-          const st = statusMap[p.id] ?? "disconnected"
-          return (
-            <button
-              key={p.id}
-              onClick={() => selectConnection(p)}
-              className={cn(
-                "flex shrink-0 items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs transition-colors",
-                form.id === p.id && !isDraft ? "border-primary bg-primary/10" : "border-border hover:bg-muted"
-              )}
-            >
-              <span className={cn("size-1.5 rounded-full", st === "connected" ? "bg-success" : st === "error" ? "bg-destructive" : "bg-muted-foreground")} />
-              {p.name}
-            </button>
-          )
-        })}
+      {/* 连接选择（按分组） */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 pb-1">
+        {grouped.map(([g, list]) => (
+          <div key={g || "_"} className="flex items-center gap-1.5">
+            {g && <span className="text-[11px] font-medium text-muted-foreground">{g}:</span>}
+            {list.map((p) => {
+              const st = statusMap[p.id] ?? "disconnected"
+              return (
+                <button
+                  key={p.id}
+                  onClick={() => selectConnection(p)}
+                  onContextMenu={(e) => { e.preventDefault(); handleDuplicate(p) }}
+                  title={t("右键复制连接")}
+                  className={cn(
+                    "flex shrink-0 items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs transition-colors",
+                    form.id === p.id && !isDraft ? "border-primary bg-primary/10" : "border-border hover:bg-muted"
+                  )}
+                >
+                  <span className={cn("size-1.5 rounded-full", st === "connected" ? "bg-success" : st === "error" ? "bg-destructive" : "bg-muted-foreground")} />
+                  {p.name}
+                </button>
+              )
+            })}
+          </div>
+        ))}
         <Button variant="outline" size="sm" className="h-7 shrink-0 gap-1 text-xs" onClick={newConnection}>
           <Plus className="size-3.5" /> {t("新建")}
         </Button>
@@ -336,15 +362,74 @@ export function ClientPage() {
               )}
             </div>
 
+            {/* 高级 */}
+            <button className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground" onClick={() => setShowAdvanced((v) => !v)}>
+              <Settings2 className="size-3.5" /> {t("高级")}
+            </button>
+            {showAdvanced && (
+              <div className="flex flex-col gap-2 rounded-md border border-border/60 p-2">
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                  <Field label={t("分组")}>
+                    <Input value={form.group} onChange={(e) => patch({ group: e.target.value })} disabled={connected} className="h-8" />
+                  </Field>
+                  <Field label={t("连接超时(s)")}>
+                    <Input type="number" value={form.connectTimeout} onChange={(e) => patch({ connectTimeout: Number(e.target.value) })} disabled={connected} className="h-8" />
+                  </Field>
+                  <Field label={t("重连间隔(ms)")}>
+                    <Input type="number" value={form.reconnectPeriodMs} onChange={(e) => patch({ reconnectPeriodMs: Number(e.target.value) })} disabled={connected} className="h-8" />
+                  </Field>
+                  <Field label={t("自动重连")}>
+                    <div className="flex h-8 items-center"><Switch checked={form.autoReconnect} onCheckedChange={(v) => patch({ autoReconnect: v })} disabled={connected} /></div>
+                  </Field>
+                </div>
+                <div className="flex flex-wrap items-center gap-3">
+                  <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                    <Switch checked={form.clientIdWithTime} onCheckedChange={(v) => patch({ clientIdWithTime: v })} disabled={connected} />
+                    {t("ClientId 追加时间戳")}
+                  </label>
+                  <Button variant="outline" size="sm" className="h-7 gap-1 text-xs" onClick={randomClientId} disabled={connected}>
+                    <Dices className="size-3.5" /> {t("随机 ClientId")}
+                  </Button>
+                </div>
+                {isTls && (
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    <Textarea value={form.clientCert} onChange={(e) => patch({ clientCert: e.target.value })} placeholder={t("客户端证书 (PEM，双向 TLS)")} rows={2} disabled={connected} className="font-mono text-xs" />
+                    <Textarea value={form.clientKey} onChange={(e) => patch({ clientKey: e.target.value })} placeholder={t("客户端私钥 (PEM)")} rows={2} disabled={connected} className="font-mono text-xs" />
+                    <Input value={form.alpn.join(",")} onChange={(e) => patch({ alpn: e.target.value.split(",").map((s) => s.trim()).filter(Boolean) })} placeholder="ALPN (mqtt,http/1.1)" disabled={connected} className="col-span-full h-8" />
+                  </div>
+                )}
+                {form.mqttVersion === 5 && (
+                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                    <Field label={t("会话过期(s)")}>
+                      <Input type="number" value={form.sessionExpiryInterval ?? ""} onChange={(e) => patch({ sessionExpiryInterval: e.target.value ? Number(e.target.value) : null })} disabled={connected} className="h-8" />
+                    </Field>
+                    <Field label="Receive Max">
+                      <Input type="number" value={form.receiveMaximum ?? ""} onChange={(e) => patch({ receiveMaximum: e.target.value ? Number(e.target.value) : null })} disabled={connected} className="h-8" />
+                    </Field>
+                    <Field label="Max Packet">
+                      <Input type="number" value={form.maximumPacketSize ?? ""} onChange={(e) => patch({ maximumPacketSize: e.target.value ? Number(e.target.value) : null })} disabled={connected} className="h-8" />
+                    </Field>
+                    <Field label="Topic Alias Max">
+                      <Input type="number" value={form.topicAliasMaximum ?? ""} onChange={(e) => patch({ topicAliasMaximum: e.target.value ? Number(e.target.value) : null })} disabled={connected} className="h-8" />
+                    </Field>
+                  </div>
+                )}
+              </div>
+            )}
+
             <div className="flex flex-wrap gap-2">
               {!connected ? (
                 <Button className="gap-1.5" onClick={handleConnect}><Plug className="size-4" /> {t("连接")}</Button>
               ) : (
                 <Button variant="outline" className="gap-1.5" onClick={handleDisconnect}><Unplug className="size-4" /> {t("断开")}</Button>
               )}
+              <Button variant="outline" className="gap-1.5" onClick={handleTest} disabled={connected || testing}><PlugZap className="size-4" /> {t("测试")}</Button>
               <Button variant="outline" className="gap-1.5" onClick={handleSave} disabled={connected}><Save className="size-4" /> {t("保存")}</Button>
               {!isDraft && (
-                <Button variant="ghost" className="gap-1.5 text-destructive" onClick={() => handleDelete(form)} disabled={connected}><Trash2 className="size-4" /> {t("删除")}</Button>
+                <>
+                  <Button variant="ghost" className="gap-1.5" onClick={() => handleDuplicate(form)} disabled={connected}><Copy className="size-4" /> {t("复制")}</Button>
+                  <Button variant="ghost" className="gap-1.5 text-destructive" onClick={() => handleDelete(form)} disabled={connected}><Trash2 className="size-4" /> {t("删除")}</Button>
+                </>
               )}
             </div>
           </CardContent>
@@ -352,26 +437,13 @@ export function ClientPage() {
 
         {/* 订阅 + 发布 */}
         <div className="flex flex-col gap-3">
-          <Card>
-            <CardContent className="flex flex-col gap-2 p-3 sm:p-4">
-              <div className="flex gap-2">
-                <Input value={subTopic} onChange={(e) => setSubTopic(e.target.value)} placeholder={t("订阅主题")} className="h-9" />
-                <QosSelect value={subQos} onChange={setSubQos} />
-                <Button className="h-9" onClick={handleSubscribe} disabled={!connected}>{t("订阅")}</Button>
-              </div>
-              {subs.length > 0 && (
-                <div className="flex flex-wrap gap-1.5">
-                  {subs.map((s) => (
-                    <button key={s.topic} onClick={() => handleUnsubscribe(s.topic)} className="flex items-center gap-1 rounded-full bg-muted px-2.5 py-1 text-xs hover:bg-destructive/15">
-                      <span className="font-mono">{s.topic}</span>
-                      <Badge variant="secondary" className="h-4 px-1 text-[10px]">Q{s.qos}</Badge>
-                      <X className="size-3" />
-                    </button>
-                  ))}
-                </div>
-              )}
-            </CardContent>
-          </Card>
+          <SubscriptionPanel
+            connId={connId}
+            connected={connected}
+            mqttVersion={form.mqttVersion}
+            subs={form.subscriptions}
+            onChange={handleSubsChange}
+          />
 
           <Card>
             <CardContent className="flex flex-col gap-2 p-3 sm:p-4">
@@ -404,7 +476,7 @@ export function ClientPage() {
       </div>
 
       {/* 消息 */}
-      <MessageViewer connId={connId} name={form.name} />
+      <MessageViewer connId={connId} name={form.name} subs={form.subscriptions} />
 
       {/* 分析：速率 / 流量 / 负载 / 内容 + 主题树 */}
       <Analysis connId={connId} connected={connected} />
