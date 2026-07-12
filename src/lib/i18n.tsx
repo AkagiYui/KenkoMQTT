@@ -175,6 +175,9 @@ const en: Record<string, string> = {
   "宽度(列)": "Width (cols)",
   单位: "Unit",
   添加: "Add",
+  新建仪表盘: "New dashboard",
+  重命名: "Rename",
+  删除仪表盘: "Delete dashboard",
   // 连接树
   未分组: "Ungrouped",
 }
