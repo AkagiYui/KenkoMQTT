@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react"
-import { Play, Square, Users, ArrowDownToLine, ArrowUpFromLine, Archive } from "lucide-react"
+import { Play, Square, Users, ArrowDownToLine, ArrowUpFromLine, Archive, Trash2, Plus, Database, Ban } from "lucide-react"
 import { toast } from "sonner"
 import {
   type BrokerConfig,
+  type BrokerUser,
   type BrokerClientRow,
   type BrokerEvt,
   type BrokerStats,
@@ -26,6 +27,7 @@ import { Switch } from "@/components/ui/switch"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent } from "@/components/ui/card"
 import { Separator } from "@/components/ui/separator"
+import { Textarea } from "@/components/ui/textarea"
 
 const eventColor: Record<string, string> = {
   connect: "text-success",
@@ -79,6 +81,19 @@ export function BrokerPage() {
     setConfig((c) => ({ ...c, ...p }))
   }
 
+  function patchUser(i: number, p: Partial<BrokerUser>) {
+    setConfig((c) => ({ ...c, users: c.users.map((u, k) => (k === i ? { ...u, ...p } : u)) }))
+  }
+  function addUser() {
+    setConfig((c) => ({ ...c, users: [...c.users, { username: "", password: "", pubAcl: [], subAcl: [] }] }))
+  }
+  function removeUser(i: number) {
+    setConfig((c) => ({ ...c, users: c.users.filter((_, k) => k !== i) }))
+  }
+  // ACL 以逗号/换行分隔的字符串编辑，存储为数组。
+  const toList = (s: string) => s.split(/[\n,]/).map((x) => x.trim()).filter(Boolean)
+  const fromList = (a: string[]) => a.join(", ")
+
   async function toggle() {
     try {
       if (running) {
@@ -97,11 +112,13 @@ export function BrokerPage() {
   return (
     <div className="mx-auto flex max-w-4xl flex-col gap-3 p-3 lg:max-w-6xl">
       {/* 概览统计 */}
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
         <Stat icon={<Users className="size-4" />} label="在线客户端" value={stats?.clientsConnected ?? 0} />
+        <Stat icon={<Database className="size-4" />} label="会话总数" value={stats?.sessions ?? 0} />
         <Stat icon={<ArrowDownToLine className="size-4" />} label="接收消息" value={stats?.msgsReceived ?? 0} />
         <Stat icon={<ArrowUpFromLine className="size-4" />} label="发送消息" value={stats?.msgsSent ?? 0} />
         <Stat icon={<Archive className="size-4" />} label="保留消息" value={stats?.retained ?? 0} />
+        <Stat icon={<Ban className="size-4" />} label="丢弃消息" value={stats?.dropped ?? 0} />
       </div>
 
       <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
@@ -130,12 +147,76 @@ export function BrokerPage() {
               <Label className="text-xs text-muted-foreground">允许匿名连接</Label>
               <Switch checked={config.allowAnonymous} onCheckedChange={(v) => patch({ allowAnonymous: v })} disabled={running} />
             </div>
-            {!config.allowAnonymous && (
+            {!config.allowAnonymous && config.users.length === 0 && (
               <div className="grid grid-cols-2 gap-2">
                 <Input value={config.username} onChange={(e) => patch({ username: e.target.value })} placeholder="用户名" disabled={running} className="h-9" />
                 <Input type="password" value={config.password} onChange={(e) => patch({ password: e.target.value })} placeholder="密码" disabled={running} className="h-9" />
               </div>
             )}
+
+            <Separator />
+
+            {/* 监听器 */}
+            <div className="flex flex-col gap-2">
+              <span className="text-xs font-medium text-muted-foreground">监听器（0 = 关闭）</span>
+              <div className="grid grid-cols-3 gap-2">
+                <LabeledNum label="TLS (mqtts)" value={config.tlsPort} onChange={(v) => patch({ tlsPort: v })} disabled={running} />
+                <LabeledNum label="WebSocket" value={config.wsPort} onChange={(v) => patch({ wsPort: v })} disabled={running} />
+                <LabeledNum label="Secure WS" value={config.wssPort} onChange={(v) => patch({ wssPort: v })} disabled={running} />
+              </div>
+              {(config.tlsPort > 0 || config.wssPort > 0) && (
+                <div className="grid grid-cols-1 gap-2">
+                  <Textarea
+                    value={config.tlsCert}
+                    onChange={(e) => patch({ tlsCert: e.target.value })}
+                    placeholder="TLS 证书链 (PEM)"
+                    disabled={running}
+                    className="h-20 font-mono text-xs"
+                  />
+                  <Textarea
+                    value={config.tlsKey}
+                    onChange={(e) => patch({ tlsKey: e.target.value })}
+                    placeholder="TLS 私钥 (PEM)"
+                    disabled={running}
+                    className="h-20 font-mono text-xs"
+                  />
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center justify-between rounded-md border border-border/60 p-2">
+              <Label className="text-xs text-muted-foreground">发布 $SYS 监控主题</Label>
+              <Switch checked={config.sysEnabled} onCheckedChange={(v) => patch({ sysEnabled: v })} disabled={running} />
+            </div>
+
+            {/* 多用户 + ACL */}
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-medium text-muted-foreground">用户与访问控制 (ACL)</span>
+                <Button variant="outline" size="sm" className="h-7 gap-1" onClick={addUser} disabled={running}>
+                  <Plus className="size-3.5" /> 添加用户
+                </Button>
+              </div>
+              {config.users.length === 0 && (
+                <div className="rounded-md bg-muted/40 px-2.5 py-2 text-xs text-muted-foreground">
+                  未配置用户时使用上方单账号 / 匿名规则。配置用户后按用户表鉴权，并按 ACL 限制主题（留空 = 不限制）。
+                </div>
+              )}
+              {config.users.map((u, i) => (
+                <div key={i} className="flex flex-col gap-1.5 rounded-md border border-border/60 p-2">
+                  <div className="flex items-center gap-2">
+                    <Input value={u.username} onChange={(e) => patchUser(i, { username: e.target.value })} placeholder="用户名" disabled={running} className="h-8" />
+                    <Input type="password" value={u.password} onChange={(e) => patchUser(i, { password: e.target.value })} placeholder="密码" disabled={running} className="h-8" />
+                    <Button variant="ghost" size="icon" className="size-8 shrink-0" onClick={() => removeUser(i)} disabled={running}>
+                      <Trash2 className="size-4 text-destructive" />
+                    </Button>
+                  </div>
+                  <Input value={fromList(u.pubAcl)} onChange={(e) => patchUser(i, { pubAcl: toList(e.target.value) })} placeholder="发布 ACL：如 sensor/#, cmd/+" disabled={running} className="h-8 font-mono text-xs" />
+                  <Input value={fromList(u.subAcl)} onChange={(e) => patchUser(i, { subAcl: toList(e.target.value) })} placeholder="订阅 ACL：如 sensor/#, $SYS/#" disabled={running} className="h-8 font-mono text-xs" />
+                </div>
+              ))}
+            </div>
+
             <Button onClick={toggle} variant={running ? "outline" : "default"} className="gap-1.5">
               {running ? <><Square className="size-4" /> 停止</> : <><Play className="size-4" /> 启动</>}
             </Button>
@@ -151,6 +232,7 @@ export function BrokerPage() {
               {clients.map((c) => (
                 <div key={c.clientId} className="flex items-center gap-2 rounded-md bg-muted/40 px-2.5 py-1.5 text-xs">
                   <span className="font-mono font-medium">{c.clientId}</span>
+                  <Badge variant="outline" className="h-4 px-1 text-[10px]">{c.proto === 5 ? "v5" : "v3.1.1"}</Badge>
                   <span className="text-muted-foreground">{c.addr}</span>
                   {c.username && <Badge variant="secondary" className="h-4 px-1 text-[10px]">{c.username}</Badge>}
                   <span className="ml-auto text-muted-foreground">{c.subs} 订阅</span>
@@ -202,6 +284,15 @@ export function BrokerPage() {
           </div>
         </CardContent>
       </Card>
+    </div>
+  )
+}
+
+function LabeledNum({ label, value, onChange, disabled }: { label: string; value: number; onChange: (v: number) => void; disabled?: boolean }) {
+  return (
+    <div className="flex flex-col gap-1">
+      <Label className="text-xs text-muted-foreground">{label}</Label>
+      <Input type="number" value={value} onChange={(e) => onChange(Number(e.target.value))} disabled={disabled} className="h-9" />
     </div>
   )
 }
