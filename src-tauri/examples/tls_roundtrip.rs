@@ -1,5 +1,5 @@
 // 验证 TLS(skip-verify) 路径：连自签名 TLS broker(:8883) → 订阅 → 发布 → 收到。
-use kenkomqtt_poc_lib::tls::client_config;
+use kenkomqtt_lib::tls::client_config;
 use rumqttc::{Client, Event, MqttOptions, Packet, QoS, TlsConfiguration, Transport};
 use std::time::Duration;
 

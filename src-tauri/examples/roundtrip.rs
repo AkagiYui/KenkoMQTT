@@ -6,7 +6,7 @@ use std::time::Duration;
 fn main() {
     let host = std::env::var("MQTT_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let port: u16 = std::env::var("MQTT_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(1883);
-    let topic = "kenko/poc/roundtrip";
+    let topic = "kenko/test/roundtrip";
 
     let mut mo = MqttOptions::new("kenko-roundtrip", host, port);
     mo.set_keep_alive(Duration::from_secs(5));

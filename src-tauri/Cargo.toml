@@ -1,12 +1,12 @@
 [package]
-name = "kenkomqtt-poc"
+name = "kenkomqtt"
 version = "0.1.0"
-description = "KenkoMQTT Tauri Android PoC"
+description = "KenkoMQTT — 本地 MQTT 调试工具（客户端 + 内嵌 broker，跨平台）"
 edition = "2021"
 
 [lib]
 # staticlib/cdylib are required for the mobile (Android/iOS) targets.
-name = "kenkomqtt_poc_lib"
+name = "kenkomqtt_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
