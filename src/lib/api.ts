@@ -181,6 +181,16 @@ export const mqttSubscribe = (
 export const mqttUnsubscribe = (connId: string, topic: string) =>
   invoke<void>("mqtt_unsubscribe", { connId, topic })
 export const mqttTestConnection = (profile: Profile) => invoke<void>("mqtt_test_connection", { profile })
+// MQTT 5.0 发布属性
+export interface PubProps {
+  contentType?: string
+  responseTopic?: string
+  correlationData?: string | null
+  messageExpiryInterval?: number | null
+  topicAlias?: number | null
+  payloadFormatIndicator?: number | null
+  userProperties?: KeyVal[]
+}
 export const mqttPublish = (
   connId: string,
   topic: string,
@@ -188,8 +198,9 @@ export const mqttPublish = (
   qos: number,
   retain: boolean,
   format: Format = "plaintext",
-  expand = false
-) => invoke<void>("mqtt_publish", { connId, topic, payload, qos, retain, format, expand })
+  expand = false,
+  props?: PubProps
+) => invoke<void>("mqtt_publish", { connId, topic, payload, qos, retain, format, expand, props: props ?? null })
 
 // ---- 消息库 / 计算（后端负责，前端仅展示） ----
 export const messagesQuery = (connId: string, opts: QueryOpts) =>

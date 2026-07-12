@@ -151,6 +151,15 @@ const en: Record<string, string> = {
   "客户端私钥 (PEM)": "Client key (PEM)",
   "会话过期(s)": "Session expiry (s)",
   测试: "Test",
+  "遗嘱延迟(s)": "Will delay (s)",
+  "消息过期(s)": "Message expiry (s)",
+  // 发布面板 (三)
+  发布历史: "Publish history",
+  暂无历史: "No history",
+  "MQTT5 发布属性": "MQTT5 publish props",
+  已清除保留消息: "Retained message cleared",
+  清除保留: "Clear retained",
+  向该主题发布空保留消息以清除: "Publish empty retained to this topic to clear",
 }
 
 interface I18nCtx {

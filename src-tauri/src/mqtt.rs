@@ -122,6 +122,40 @@ pub struct MsgPage {
     /// 过滤后的匹配总数（用于分页）。
     pub total: usize,
 }
+
+/// MQTT 5.0 发布属性（v4 忽略）。
+#[derive(Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PubProps {
+    #[serde(default)]
+    pub content_type: String,
+    #[serde(default)]
+    pub response_topic: String,
+    #[serde(default)]
+    pub correlation_data: Option<String>, // hex
+    #[serde(default)]
+    pub message_expiry_interval: Option<u32>,
+    #[serde(default)]
+    pub topic_alias: Option<u16>,
+    #[serde(default)]
+    pub payload_format_indicator: Option<u8>,
+    #[serde(default)]
+    pub user_properties: Vec<crate::model::KeyVal>,
+}
+impl PubProps {
+    fn is_empty(&self) -> bool {
+        self.content_type.is_empty()
+            && self.response_topic.is_empty()
+            && self.correlation_data.is_none()
+            && self.message_expiry_interval.is_none()
+            && self.topic_alias.is_none()
+            && self.payload_format_indicator.is_none()
+            && self.user_properties.is_empty()
+    }
+}
+fn opt_str(s: &str) -> Option<String> {
+    (!s.is_empty()).then(|| s.to_string())
+}
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TreeNode {
@@ -314,6 +348,29 @@ impl ClientKind {
         match self {
             ClientKind::V4(c) => c.publish(topic, v4_qos(qos), retain, payload).await.map_err(|e| e.to_string()),
             ClientKind::V5(c) => c.publish(topic, v5_qos(qos), retain, payload).await.map_err(|e| e.to_string()),
+        }
+    }
+    /// 带 MQTT 5.0 发布属性的发布（v4 忽略属性）。
+    async fn publish_props(&self, topic: String, payload: Vec<u8>, qos: u8, retain: bool, props: &PubProps) -> Result<(), String> {
+        match self {
+            ClientKind::V4(c) => c.publish(topic, v4_qos(qos), retain, payload).await.map_err(|e| e.to_string()),
+            ClientKind::V5(c) => {
+                if props.is_empty() {
+                    return c.publish(topic, v5_qos(qos), retain, payload).await.map_err(|e| e.to_string());
+                }
+                use rumqttc::v5::mqttbytes::v5::PublishProperties;
+                let pp = PublishProperties {
+                    payload_format_indicator: props.payload_format_indicator,
+                    message_expiry_interval: props.message_expiry_interval,
+                    topic_alias: props.topic_alias,
+                    response_topic: opt_str(&props.response_topic),
+                    correlation_data: props.correlation_data.as_ref().and_then(|h| hex::decode(h).ok()).map(bytes::Bytes::from),
+                    content_type: opt_str(&props.content_type),
+                    user_properties: props.user_properties.iter().map(|kv| (kv.key.clone(), kv.value.clone())).collect(),
+                    subscription_identifiers: vec![],
+                };
+                c.publish_with_properties(topic, v5_qos(qos), retain, payload, pp).await.map_err(|e| e.to_string())
+            }
         }
     }
     async fn disconnect(&self) {
@@ -999,6 +1056,7 @@ pub async fn publish(
     retain: bool,
     format: Option<Format>,
     expand: Option<bool>,
+    props: Option<PubProps>,
 ) -> Result<(), String> {
     let fmt = format.unwrap_or(Format::Plaintext);
     let text = if expand.unwrap_or(false) {
@@ -1008,7 +1066,10 @@ pub async fn publish(
     };
     let bytes = codec::encode(&text, fmt)?;
     let c = mgr.client_of(&conn_id).ok_or("未连接")?;
-    c.publish(topic.clone(), bytes.clone(), qos, retain).await?;
+    match &props {
+        Some(p) => c.publish_props(topic.clone(), bytes.clone(), qos, retain, p).await?,
+        None => c.publish(topic.clone(), bytes.clone(), qos, retain).await?,
+    }
     record_mgr(&mgr, &app, &conn_id, "tx", topic, bytes, qos, retain);
     Ok(())
 }
@@ -1182,6 +1243,39 @@ mod tests {
         let page = mgr.query("c", &QueryOpts { limit: 1, offset: 0, ..Default::default() });
         assert_eq!(page.total, 3);
         assert_eq!(page.rows.len(), 1);
+    }
+
+    #[test]
+    fn clear_topic_removes_matching() {
+        let mgr = Manager::default();
+        push(&mgr, "rx", "a/b", b"1", 0);
+        push(&mgr, "rx", "a/c", b"2", 0);
+        push(&mgr, "rx", "x/y", b"3", 0);
+        mgr.clear_topic("c", "a/+");
+        let page = mgr.query("c", &QueryOpts { limit: 100, ..Default::default() });
+        assert_eq!(page.total, 1);
+        assert_eq!(page.rows[0].topic, "x/y");
+    }
+
+    #[test]
+    fn chart_load_aggregates_size() {
+        let mgr = Manager::default();
+        push(&mgr, "rx", "s/1", b"abcd", 0); // 4 bytes
+        push(&mgr, "rx", "s/2", b"ab", 0); // 2 bytes
+        let pts = mgr.chart_load("c", "s/#", "sum", 60_000, 1);
+        assert_eq!(pts.len(), 1);
+        assert_eq!(pts[0].v, 6.0);
+        let pts = mgr.chart_load("c", "s/#", "max", 60_000, 1);
+        assert_eq!(pts[0].v, 4.0);
+        let pts = mgr.chart_load("c", "s/#", "count", 60_000, 1);
+        assert_eq!(pts[0].v, 2.0);
+    }
+
+    #[test]
+    fn pub_props_is_empty() {
+        assert!(PubProps::default().is_empty());
+        let p = PubProps { content_type: "application/json".into(), ..Default::default() };
+        assert!(!p.is_empty());
     }
 
     #[test]

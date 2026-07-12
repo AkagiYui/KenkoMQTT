@@ -108,8 +108,9 @@ async fn mqtt_publish(
     retain: bool,
     format: Option<codec::Format>,
     expand: Option<bool>,
+    props: Option<mqtt::PubProps>,
 ) -> Result<(), String> {
-    mqtt::publish(app, mgr, conn_id, topic, payload, qos, retain, format, expand).await
+    mqtt::publish(app, mgr, conn_id, topic, payload, qos, retain, format, expand, props).await
 }
 
 // ---- 消息库 / 计算（后端） ----

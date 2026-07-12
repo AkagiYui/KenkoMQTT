@@ -1,22 +1,17 @@
 import { useEffect, useMemo, useState } from "react"
-import { Plus, Plug, Unplug, Trash2, Send, Save, Timer, Copy, PlugZap, Settings2, Dices } from "lucide-react"
+import { Plus, Plug, Unplug, Trash2, Save, Copy, PlugZap, Settings2, Dices } from "lucide-react"
 import { toast } from "sonner"
 import {
   type Profile,
   type SubProfile,
   type Protocol,
   type Status,
-  type Format,
-  FORMATS,
   listProfiles,
   saveProfile,
   deleteProfile,
   mqttConnect,
   mqttDisconnect,
-  mqttPublish,
   mqttTestConnection,
-  scheduleStart,
-  scheduleStop,
   onStatus,
   newProfile,
   DEFAULT_PORTS,
@@ -27,6 +22,7 @@ import { useI18n } from "@/lib/i18n"
 import { MessageViewer } from "@/components/MessageViewer"
 import { Analysis } from "@/components/Analysis"
 import { SubscriptionPanel } from "@/components/SubscriptionPanel"
+import { PublishPanel } from "@/components/PublishPanel"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -57,19 +53,6 @@ function QosSelect({ value, onChange, className }: { value: number; onChange: (n
   )
 }
 
-function FormatSelect({ value, onChange, className }: { value: Format; onChange: (f: Format) => void; className?: string }) {
-  return (
-    <Select value={value} onValueChange={(v) => onChange(v as Format)}>
-      <SelectTrigger className={cn("h-9 w-32", className)}><SelectValue /></SelectTrigger>
-      <SelectContent>
-        {FORMATS.map((f) => (
-          <SelectItem key={f} value={f}>{f}</SelectItem>
-        ))}
-      </SelectContent>
-    </Select>
-  )
-}
-
 export function ClientPage() {
   const { t } = useI18n()
   const [profiles, setProfiles] = useState<Profile[]>([])
@@ -78,15 +61,6 @@ export function ClientPage() {
   const [statusMap, setStatusMap] = useState<Record<string, Status>>({})
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [testing, setTesting] = useState(false)
-
-  const [pubTopic, setPubTopic] = useState("test/topic")
-  const [pubPayload, setPubPayload] = useState('{\n  "value": ${int(0,100)}\n}')
-  const [pubQos, setPubQos] = useState(0)
-  const [pubRetain, setPubRetain] = useState(false)
-  const [pubFormat, setPubFormat] = useState<Format>("plaintext")
-  const [pubExpand, setPubExpand] = useState(true)
-  const [interval, setIntervalMs] = useState(1000)
-  const [scheduleId, setScheduleId] = useState<string | null>(null)
 
   const connId = form.id
   const status = statusMap[connId] ?? "disconnected"
@@ -216,29 +190,6 @@ export function ClientPage() {
   function randomClientId() {
     patch({ clientId: `kenko-${Math.random().toString(36).slice(2, 10)}` })
   }
-  async function handlePublish() {
-    if (!connected || !pubTopic.trim()) return
-    try {
-      await mqttPublish(connId, pubTopic, pubPayload, pubQos, pubRetain, pubFormat, pubExpand)
-    } catch (e: any) {
-      toast.error(t("发布失败"), { description: String(e?.message ?? e) })
-    }
-  }
-  async function toggleSchedule() {
-    if (scheduleId) {
-      await scheduleStop(scheduleId).catch(() => {})
-      setScheduleId(null)
-    } else {
-      if (!connected) return
-      try {
-        const id = await scheduleStart(connId, pubTopic, pubPayload, pubQos, pubRetain, pubFormat, interval)
-        setScheduleId(id)
-        toast.success(t("定时发布已启动") + ` (${interval}ms)`)
-      } catch (e: any) {
-        toast.error(t("定时发布失败"), { description: String(e?.message ?? e) })
-      }
-    }
-  }
 
   const isTls = form.protocol === "tls" || form.protocol === "wss"
   const isWs = form.protocol === "ws" || form.protocol === "wss"
@@ -358,6 +309,14 @@ export function ClientPage() {
                     <Switch checked={form.will.retain} onCheckedChange={(v) => patch({ will: { ...form.will, retain: v } })} disabled={connected} />
                     <span className="text-xs text-muted-foreground">retain</span>
                   </div>
+                  {form.mqttVersion === 5 && (
+                    <>
+                      <Input value={form.will.contentType ?? ""} onChange={(e) => patch({ will: { ...form.will, contentType: e.target.value } })} placeholder="Content Type" disabled={connected} className="h-9" />
+                      <Input value={form.will.responseTopic ?? ""} onChange={(e) => patch({ will: { ...form.will, responseTopic: e.target.value } })} placeholder="Response Topic" disabled={connected} className="h-9" />
+                      <Input type="number" value={form.will.delayInterval ?? ""} onChange={(e) => patch({ will: { ...form.will, delayInterval: e.target.value ? Number(e.target.value) : null } })} placeholder={t("遗嘱延迟(s)")} disabled={connected} className="h-9" />
+                      <Input type="number" value={form.will.messageExpiryInterval ?? ""} onChange={(e) => patch({ will: { ...form.will, messageExpiryInterval: e.target.value ? Number(e.target.value) : null } })} placeholder={t("消息过期(s)")} disabled={connected} className="h-9" />
+                    </>
+                  )}
                 </div>
               )}
             </div>
@@ -445,33 +404,7 @@ export function ClientPage() {
             onChange={handleSubsChange}
           />
 
-          <Card>
-            <CardContent className="flex flex-col gap-2 p-3 sm:p-4">
-              <Input value={pubTopic} onChange={(e) => setPubTopic(e.target.value)} placeholder={t("发布主题")} className="h-9" />
-              <Textarea value={pubPayload} onChange={(e) => setPubPayload(e.target.value)} rows={3} className="font-mono text-sm" />
-              <div className="flex flex-wrap items-center gap-2">
-                <QosSelect value={pubQos} onChange={setPubQos} />
-                <FormatSelect value={pubFormat} onChange={setPubFormat} />
-                <div className="flex items-center gap-1.5">
-                  <Switch checked={pubRetain} onCheckedChange={setPubRetain} />
-                  <span className="text-xs text-muted-foreground">retain</span>
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <Switch checked={pubExpand} onCheckedChange={setPubExpand} />
-                  <span className="text-xs text-muted-foreground">{t("占位符")}</span>
-                </div>
-                <Button className="ml-auto h-9 gap-1.5" onClick={handlePublish} disabled={!connected}><Send className="size-4" /> {t("发布")}</Button>
-              </div>
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-xs text-muted-foreground">{t("定时")}</span>
-                <Input type="number" value={interval} onChange={(e) => setIntervalMs(Number(e.target.value))} className="h-8 w-24" disabled={!!scheduleId} />
-                <span className="text-xs text-muted-foreground">ms</span>
-                <Button variant={scheduleId ? "outline" : "secondary"} size="sm" className="h-8 gap-1.5" onClick={toggleSchedule} disabled={!connected}>
-                  <Timer className="size-3.5" /> {scheduleId ? t("停止") : t("开始")}
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
+          <PublishPanel connId={connId} connected={connected} mqttVersion={form.mqttVersion} />
         </div>
       </div>
 
