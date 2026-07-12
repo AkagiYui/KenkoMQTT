@@ -232,7 +232,7 @@ jobs:
   # 真机 .ipa 的 export 步骤需要签名证书；无 secrets 时只能产出「模拟器 .app」这种免签名产物。
   # 要 CI 直接出可安装到真机的签名 .ipa，需把证书(.p12)+描述文件放 GitHub Secrets 再签（见 README）。
   ios:
-    name: 构建 iOS (模拟器·免签名)
+    name: 构建 iOS (模拟器 .app + 未签名 .ipa)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -249,10 +249,10 @@ jobs:
           cache: pnpm
           cache-dependency-path: ${{ env.APP_DIR }}/pnpm-lock.yaml
 
-      - name: 安装 Rust (iOS 模拟器 target)
+      - name: 安装 Rust (iOS 模拟器 + 真机 target)
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-ios-sim
+          targets: aarch64-apple-ios-sim,aarch64-apple-ios
 
       - name: Rust 缓存
         uses: swatinem/rust-cache@v2
@@ -283,12 +283,42 @@ jobs:
           test -n "$APP"
           ditto -c -k --sequesterRsrc --keepParent "$APP" "$RUNNER_TEMP/KenkoMQTT-iossim.app.zip"
 
-      - name: 上传产物
+      - name: 上传模拟器 .app
         uses: actions/upload-artifact@v7
         with:
           name: kenkomqtt-ios-simulator
           if-no-files-found: error
           path: ${{ runner.temp }}/KenkoMQTT-iossim.app.zip
+
+      # 未签名真机 .ipa：走 tauri 生产构建(避免 dev-server 问题)并关闭签名 → archive 为未签名，
+      # export 会因无签名失败(忽略)，随后从 .xcarchive 取未签名 .app 打包为 .ipa。
+      # 该 .ipa 不能直接装真机，需 AltStore/Sideloadly/TrollStore 侧载重签。
+      - name: 构建未签名真机 .app（archive）
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -uo pipefail
+          pnpm tauri ios build --target aarch64 -- \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" PROVISIONING_PROFILE_SPECIFIER="" || true
+
+      - name: 打包未签名 .ipa
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          APP="$(find src-tauri/gen/apple/build -path '*.xcarchive/Products/Applications/*.app' -type d | head -1)"
+          echo "unsigned app=$APP"
+          test -n "$APP"
+          rm -rf "$RUNNER_TEMP/Payload" && mkdir -p "$RUNNER_TEMP/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/Payload/"
+          (cd "$RUNNER_TEMP" && zip -qr "$RUNNER_TEMP/KenkoMQTT-unsigned.ipa" Payload)
+          ls -lh "$RUNNER_TEMP/KenkoMQTT-unsigned.ipa"
+
+      - name: 上传未签名 .ipa
+        uses: actions/upload-artifact@v7
+        with:
+          name: kenkomqtt-ios-unsigned-ipa
+          if-no-files-found: error
+          path: ${{ runner.temp }}/KenkoMQTT-unsigned.ipa
 
   # ---------- Linux：AppImage / deb / rpm × x86_64 / arm64（原生 runner 构建） ----------
   # Tauri v2 需要 webkit2gtk-4.1（仅 Ubuntu 24.04+ 提供），故在 24.04 上构建；
