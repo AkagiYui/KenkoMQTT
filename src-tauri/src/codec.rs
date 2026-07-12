@@ -3,9 +3,10 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Format {
+    #[default]
     #[serde(alias = "plaintext", alias = "text")]
     Plaintext,
     Json,

@@ -34,6 +34,9 @@ struct StoredMsg {
     qos: u8,
     retain: bool,
     ts: u64,
+    /// MQTT 5.0 属性（内容类型 / 用户属性 / 响应主题等），v4 或无属性时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    props: Option<serde_json::Value>,
 }
 
 /// 单连接落盘结构（含 connId，便于安全化文件名后仍能还原原始 id）。
@@ -67,6 +70,43 @@ pub struct MsgRow {
     pub qos: u8,
     pub retain: bool,
     pub ts: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub props: Option<serde_json::Value>,
+}
+
+/// 分页查询选项（后端负责过滤/解码/分页，前端仅展示）。
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryOpts {
+    #[serde(default)]
+    pub format: Format,
+    #[serde(default)]
+    pub filter: Option<String>,
+    #[serde(default)]
+    pub regex: bool,
+    #[serde(default)]
+    pub case_sensitive: bool,
+    #[serde(default)]
+    pub whole_word: bool,
+    #[serde(default)]
+    pub ignore_qos0: bool,
+    #[serde(default)]
+    pub dir: Option<String>, // rx | tx
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+}
+fn default_limit() -> usize {
+    500
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MsgPage {
+    pub rows: Vec<MsgRow>,
+    /// 过滤后的匹配总数（用于分页）。
+    pub total: usize,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -74,6 +114,10 @@ pub struct TreeNode {
     pub name: String,
     pub full: String,
     pub count: u64,
+    /// 该主题最近一条消息的载荷预览（已按格式解码，截断）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest: Option<String>,
+    pub ts: u64,
     pub children: Vec<TreeNode>,
 }
 #[derive(Serialize)]
@@ -85,6 +129,15 @@ pub struct RatePoint {
 pub struct ContentPoint {
     pub t: u64,
     pub v: f64,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrafficPoint {
+    pub t: u64,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub rx_count: u64,
+    pub tx_count: u64,
 }
 
 pub fn now_ms() -> u64 {
@@ -115,6 +168,39 @@ fn topic_matches(filter: &str, topic: &str) -> bool {
     f.len() == t.len()
 }
 
+type Matcher = Box<dyn Fn(&str, &str) -> bool>;
+
+/// 依据查询选项构造「主题或载荷是否匹配」的判定闭包。filter 为空返回 None（全匹配）。
+fn build_matcher(opts: &QueryOpts) -> Option<Matcher> {
+    let raw = opts.filter.as_deref().unwrap_or("").trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // 需要正则引擎的情况：显式正则、或全词匹配。
+    if opts.regex || opts.whole_word {
+        let mut pat = if opts.regex { raw.to_string() } else { regex::escape(raw) };
+        if opts.whole_word {
+            pat = format!(r"\b{pat}\b");
+        }
+        let re = regex::RegexBuilder::new(&pat)
+            .case_insensitive(!opts.case_sensitive)
+            .build();
+        if let Ok(re) = re {
+            return Some(Box::new(move |topic: &str, payload: &str| re.is_match(topic) || re.is_match(payload)));
+        }
+        // 正则非法 → 回退子串。
+    }
+    if opts.case_sensitive {
+        let needle = raw.to_string();
+        Some(Box::new(move |topic: &str, payload: &str| topic.contains(&needle) || payload.contains(&needle)))
+    } else {
+        let needle = raw.to_lowercase();
+        Some(Box::new(move |topic: &str, payload: &str| {
+            topic.to_lowercase().contains(&needle) || payload.to_lowercase().contains(&needle)
+        }))
+    }
+}
+
 fn v4_qos(n: u8) -> rumqttc::QoS {
     match n {
         1 => rumqttc::QoS::AtLeastOnce,
@@ -139,10 +225,25 @@ fn emit_status(app: &AppHandle, conn_id: &str, status: &str, detail: Option<Stri
 
 /// 记录一条消息到后端库并向前端发出「有新消息」信号（前端据此按需重新查询）。
 fn record(store: &MsgLog, app: &AppHandle, conn_id: &str, dir: &'static str, topic: String, payload: Vec<u8>, qos: u8, retain: bool) {
+    record_props(store, app, conn_id, dir, topic, payload, qos, retain, None);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_props(
+    store: &MsgLog,
+    app: &AppHandle,
+    conn_id: &str,
+    dir: &'static str,
+    topic: String,
+    payload: Vec<u8>,
+    qos: u8,
+    retain: bool,
+    props: Option<serde_json::Value>,
+) {
     {
         let mut g = store.lock().unwrap();
         let dq = g.entry(conn_id.to_string()).or_default();
-        dq.push_back(StoredMsg { dir: dir.to_string(), topic, payload, qos, retain, ts: now_ms() });
+        dq.push_back(StoredMsg { dir: dir.to_string(), topic, payload, qos, retain, ts: now_ms(), props });
         while dq.len() > MAX_MSGS {
             dq.pop_front();
         }
@@ -200,33 +301,49 @@ impl Manager {
         self.conns.lock().unwrap().remove(conn_id)
     }
 
-    /// 过滤 + 按格式解码后返回最近 limit 条（按时间升序）。
-    pub fn query(&self, conn_id: &str, format: Format, filter: Option<String>, limit: usize) -> Vec<MsgRow> {
+    /// 过滤（子串 / 正则 / 大小写 / 全词 / 方向 / 忽略QoS0）+ 解码 + 分页。返回按时间升序的一页与匹配总数。
+    pub fn query(&self, conn_id: &str, opts: &QueryOpts) -> MsgPage {
         let g = self.store.lock().unwrap();
-        let Some(dq) = g.get(conn_id) else { return vec![] };
-        let f = filter.unwrap_or_default().to_lowercase();
-        let mut rows: Vec<MsgRow> = dq
+        let Some(dq) = g.get(conn_id) else {
+            return MsgPage { rows: vec![], total: 0 };
+        };
+        let fmt = opts.format;
+        let matcher = build_matcher(opts);
+        // 时间升序遍历，收集匹配项索引。
+        let matched: Vec<&StoredMsg> = dq
             .iter()
-            .rev()
             .filter(|m| {
-                if f.is_empty() {
-                    return true;
+                if opts.ignore_qos0 && m.qos == 0 {
+                    return false;
                 }
-                m.topic.to_lowercase().contains(&f) || codec::decode(&m.payload, format).to_lowercase().contains(&f)
+                if let Some(d) = &opts.dir {
+                    if !d.is_empty() && &m.dir != d {
+                        return false;
+                    }
+                }
+                match &matcher {
+                    Some(f) => f(&m.topic, &codec::decode(&m.payload, fmt)),
+                    None => true,
+                }
             })
-            .take(limit)
+            .collect();
+        let total = matched.len();
+        let rows: Vec<MsgRow> = matched
+            .into_iter()
+            .skip(opts.offset)
+            .take(opts.limit)
             .map(|m| MsgRow {
-                dir: m.dir.to_string(),
+                dir: m.dir.clone(),
                 topic: m.topic.clone(),
-                payload: codec::decode(&m.payload, format),
+                payload: codec::decode(&m.payload, fmt),
                 size: m.payload.len(),
                 qos: m.qos,
                 retain: m.retain,
                 ts: m.ts,
+                props: m.props.clone(),
             })
             .collect();
-        rows.reverse();
-        rows
+        MsgPage { rows, total }
     }
 
     pub fn clear_msgs(&self, conn_id: &str) {
@@ -235,6 +352,17 @@ impl Manager {
         if let Some(p) = self.msg_file(conn_id) {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    /// 清空某连接下与 topic_filter（支持通配符）匹配的消息。
+    pub fn clear_topic(&self, conn_id: &str, topic_filter: &str) {
+        {
+            let mut g = self.store.lock().unwrap();
+            if let Some(dq) = g.get_mut(conn_id) {
+                dq.retain(|m| !topic_matches(topic_filter, &m.topic));
+            }
+        }
+        self.dirty.lock().unwrap().insert(conn_id.to_string());
     }
 
     // ---- 消息落盘：每连接一个 {connId}.json（存最近 MAX_MSGS 条） ----
@@ -287,10 +415,12 @@ impl Manager {
         }
     }
 
-    pub fn topic_tree(&self, conn_id: &str) -> Vec<TreeNode> {
+    pub fn topic_tree(&self, conn_id: &str, format: Format) -> Vec<TreeNode> {
         #[derive(Default)]
         struct Raw {
             count: u64,
+            latest: Option<String>,
+            ts: u64,
             children: BTreeMap<String, Raw>,
         }
         let g = self.store.lock().unwrap();
@@ -302,11 +432,19 @@ impl Manager {
                 node = node.children.entry(seg.to_string()).or_default();
             }
             node.count += 1;
+            if m.ts >= node.ts {
+                node.ts = m.ts;
+                let mut s = codec::decode(&m.payload, format);
+                if s.chars().count() > 120 {
+                    s = s.chars().take(120).collect::<String>() + "…";
+                }
+                node.latest = Some(s);
+            }
         }
         fn conv(prefix: &str, name: &str, raw: &Raw) -> TreeNode {
             let full = if prefix.is_empty() { name.to_string() } else { format!("{prefix}/{name}") };
             let children = raw.children.iter().map(|(k, v)| conv(&full, k, v)).collect();
-            TreeNode { name: name.to_string(), full, count: raw.count, children }
+            TreeNode { name: name.to_string(), full, count: raw.count, latest: raw.latest.clone(), ts: raw.ts, children }
         }
         root.children.iter().map(|(k, v)| conv("", k, v)).collect()
     }
@@ -332,6 +470,72 @@ impl Manager {
             .into_iter()
             .enumerate()
             .map(|(i, c)| RatePoint { t: start + i as u64 * bucket_ms, v: c })
+            .collect()
+    }
+
+    /// 流量图表：最近 buckets 个时间桶内的收/发字节与条数。
+    pub fn chart_traffic(&self, conn_id: &str, bucket_ms: u64, buckets: usize) -> Vec<TrafficPoint> {
+        let g = self.store.lock().unwrap();
+        let now = now_ms();
+        let bucket_ms = bucket_ms.max(1);
+        let start = now.saturating_sub(bucket_ms * buckets as u64);
+        let mut pts: Vec<TrafficPoint> = (0..buckets)
+            .map(|i| TrafficPoint { t: start + i as u64 * bucket_ms, rx_bytes: 0, tx_bytes: 0, rx_count: 0, tx_count: 0 })
+            .collect();
+        if let Some(dq) = g.get(conn_id) {
+            for m in dq.iter() {
+                if m.ts >= start && m.ts <= now {
+                    let idx = ((m.ts - start) / bucket_ms) as usize;
+                    if let Some(p) = pts.get_mut(idx.min(buckets - 1)) {
+                        if m.dir == "rx" {
+                            p.rx_bytes += m.payload.len() as u64;
+                            p.rx_count += 1;
+                        } else {
+                            p.tx_bytes += m.payload.len() as u64;
+                            p.tx_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        pts
+    }
+
+    /// 负载图表：对匹配 topic 的消息按时间桶聚合载荷大小（count/avg/sum/max/min）。
+    pub fn chart_load(&self, conn_id: &str, topic_filter: &str, method: &str, bucket_ms: u64, buckets: usize) -> Vec<ContentPoint> {
+        let g = self.store.lock().unwrap();
+        let now = now_ms();
+        let bucket_ms = bucket_ms.max(1);
+        let start = now.saturating_sub(bucket_ms * buckets as u64);
+        let mut sizes: Vec<Vec<f64>> = vec![Vec::new(); buckets];
+        if let Some(dq) = g.get(conn_id) {
+            for m in dq.iter() {
+                if !topic_filter.is_empty() && !topic_matches(topic_filter, &m.topic) {
+                    continue;
+                }
+                if m.ts >= start && m.ts <= now {
+                    let idx = (((m.ts - start) / bucket_ms) as usize).min(buckets - 1);
+                    sizes[idx].push(m.payload.len() as f64);
+                }
+            }
+        }
+        sizes
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let val = if v.is_empty() {
+                    0.0
+                } else {
+                    match method {
+                        "avg" => v.iter().sum::<f64>() / v.len() as f64,
+                        "sum" => v.iter().sum::<f64>(),
+                        "max" => v.iter().cloned().fold(f64::MIN, f64::max),
+                        "min" => v.iter().cloned().fold(f64::MAX, f64::min),
+                        _ => v.len() as f64, // count
+                    }
+                };
+                ContentPoint { t: start + i as u64 * bucket_ms, v: val }
+            })
             .collect()
     }
 
@@ -497,6 +701,44 @@ fn connect_v4(app: AppHandle, mgr: &Manager, conn_id: &str, client_id: &str, p: 
     Ok(())
 }
 
+/// 把 v5 PUBLISH 属性转为展示用 JSON（仅含存在的字段）。
+fn v5_publish_props_json(props: &rumqttc::v5::mqttbytes::v5::PublishProperties) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = props.payload_format_indicator {
+        m.insert("payloadFormatIndicator".into(), v.into());
+    }
+    if let Some(v) = props.message_expiry_interval {
+        m.insert("messageExpiryInterval".into(), v.into());
+    }
+    if let Some(v) = props.topic_alias {
+        m.insert("topicAlias".into(), v.into());
+    }
+    if let Some(v) = &props.response_topic {
+        m.insert("responseTopic".into(), v.clone().into());
+    }
+    if let Some(v) = &props.correlation_data {
+        m.insert("correlationData".into(), hex::encode(v).into());
+    }
+    if let Some(v) = &props.content_type {
+        m.insert("contentType".into(), v.clone().into());
+    }
+    if !props.subscription_identifiers.is_empty() {
+        m.insert(
+            "subscriptionIdentifiers".into(),
+            props.subscription_identifiers.iter().map(|&x| x as u64).collect::<Vec<_>>().into(),
+        );
+    }
+    if !props.user_properties.is_empty() {
+        let ups: Vec<serde_json::Value> = props
+            .user_properties
+            .iter()
+            .map(|(k, v)| serde_json::json!({ "key": k, "value": v }))
+            .collect();
+        m.insert("userProperties".into(), ups.into());
+    }
+    serde_json::Value::Object(m)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn connect_v5(app: AppHandle, mgr: &Manager, conn_id: &str, client_id: &str, p: &Profile, addr: String, port: u16, transport: rumqttc::Transport) -> Result<(), String> {
     use rumqttc::v5::mqttbytes::v5::Packet;
@@ -522,7 +764,8 @@ fn connect_v5(app: AppHandle, mgr: &Manager, conn_id: &str, client_id: &str, p: 
             match eventloop.poll().await {
                 Ok(Event::Incoming(Packet::ConnAck(_))) => emit_status(&app2, &id, "connected", None),
                 Ok(Event::Incoming(Packet::Publish(pkt))) => {
-                    record(
+                    let props = pkt.properties.as_ref().map(v5_publish_props_json);
+                    record_props(
                         &store,
                         &app2,
                         &id,
@@ -531,6 +774,7 @@ fn connect_v5(app: AppHandle, mgr: &Manager, conn_id: &str, client_id: &str, p: 
                         pkt.payload.to_vec(),
                         pkt.qos as u8,
                         pkt.retain,
+                        props,
                     );
                     dirty.lock().unwrap().insert(id.clone());
                 }
@@ -706,6 +950,66 @@ pub fn expand_placeholders(input: &str, counter: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn push(mgr: &Manager, dir: &str, topic: &str, payload: &[u8], qos: u8) {
+        let mut g = mgr.store.lock().unwrap();
+        let dq = g.entry("c".into()).or_default();
+        dq.push_back(StoredMsg {
+            dir: dir.into(),
+            topic: topic.into(),
+            payload: payload.to_vec(),
+            qos,
+            retain: false,
+            ts: now_ms(),
+            props: None,
+        });
+    }
+
+    #[test]
+    fn topic_wildcards() {
+        assert!(topic_matches("a/+/c", "a/b/c"));
+        assert!(topic_matches("a/#", "a/b/c/d"));
+        assert!(!topic_matches("a/+/c", "a/b/d"));
+        assert!(!topic_matches("a/b", "a/b/c"));
+    }
+
+    #[test]
+    fn query_filters_and_pagination() {
+        let mgr = Manager::default();
+        push(&mgr, "rx", "sensor/temp", b"23.5", 0);
+        push(&mgr, "tx", "sensor/hum", b"hello world", 1);
+        push(&mgr, "rx", "sensor/temp", b"error!", 2);
+
+        // 子串（大小写不敏感）匹配主题或载荷
+        let page = mgr.query("c", &QueryOpts { filter: Some("HELLO".into()), limit: 100, ..Default::default() });
+        assert_eq!(page.total, 1);
+        assert_eq!(page.rows[0].topic, "sensor/hum");
+
+        // 忽略 QoS0
+        let page = mgr.query("c", &QueryOpts { ignore_qos0: true, limit: 100, ..Default::default() });
+        assert_eq!(page.total, 2);
+
+        // 方向过滤
+        let page = mgr.query("c", &QueryOpts { dir: Some("rx".into()), limit: 100, ..Default::default() });
+        assert_eq!(page.total, 2);
+
+        // 正则
+        let page = mgr.query("c", &QueryOpts { filter: Some(r"\d+\.\d+".into()), regex: true, limit: 100, ..Default::default() });
+        assert_eq!(page.total, 1);
+        assert_eq!(page.rows[0].payload, "23.5");
+
+        // 分页：limit 1 但 total 反映全部
+        let page = mgr.query("c", &QueryOpts { limit: 1, offset: 0, ..Default::default() });
+        assert_eq!(page.total, 3);
+        assert_eq!(page.rows.len(), 1);
+    }
+
+    #[test]
+    fn whole_word_matcher() {
+        let m = build_matcher(&QueryOpts { filter: Some("err".into()), whole_word: true, ..Default::default() }).unwrap();
+        assert!(!m("t", "errors here")); // err 不是独立单词
+        assert!(m("t", "an err occurred"));
+    }
 
     #[test]
     fn placeholders() {

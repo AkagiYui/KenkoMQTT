@@ -35,6 +35,22 @@ export interface Profile {
 export type Format = "plaintext" | "json" | "hex" | "base64" | "msgpack" | "cbor"
 export const FORMATS: Format[] = ["plaintext", "json", "hex", "base64", "msgpack", "cbor"]
 
+export interface UserProperty {
+  key: string
+  value: string
+}
+// MQTT 5.0 逐条属性（存在才有）
+export interface MsgProps {
+  payloadFormatIndicator?: number
+  messageExpiryInterval?: number
+  topicAlias?: number
+  responseTopic?: string
+  correlationData?: string
+  contentType?: string
+  subscriptionIdentifiers?: number[]
+  userProperties?: UserProperty[]
+}
+
 // 后端消息库返回的行（已按格式解码 + 过滤）
 export interface MsgRow {
   dir: "rx" | "tx"
@@ -44,6 +60,24 @@ export interface MsgRow {
   qos: number
   retain: boolean
   ts: number
+  props?: MsgProps
+}
+
+// 消息分页查询选项（过滤/正则/大小写/全词/方向/忽略QoS0/分页均在后端完成）
+export interface QueryOpts {
+  format: Format
+  filter?: string | null
+  regex?: boolean
+  caseSensitive?: boolean
+  wholeWord?: boolean
+  ignoreQos0?: boolean
+  dir?: "rx" | "tx" | null
+  offset?: number
+  limit?: number
+}
+export interface MsgPage {
+  rows: MsgRow[]
+  total: number
 }
 
 export interface StatusEvent {
@@ -56,6 +90,8 @@ export interface TreeNode {
   name: string
   full: string
   count: number
+  latest?: string
+  ts: number
   children: TreeNode[]
 }
 export interface RatePoint {
@@ -66,6 +102,14 @@ export interface ContentPoint {
   t: number
   v: number
 }
+export interface TrafficPoint {
+  t: number
+  rxBytes: number
+  txBytes: number
+  rxCount: number
+  txCount: number
+}
+export type LoadMethod = "count" | "avg" | "sum" | "max" | "min"
 
 // ---- 连接档案 ----
 export const listProfiles = () => invoke<Profile[]>("list_profiles")
@@ -102,12 +146,18 @@ export const mqttPublish = (
 ) => invoke<void>("mqtt_publish", { connId, topic, payload, qos, retain, format, expand })
 
 // ---- 消息库 / 计算（后端负责，前端仅展示） ----
-export const messagesQuery = (connId: string, format: Format, filter: string, limit = 500) =>
-  invoke<MsgRow[]>("messages_query", { connId, format, filter: filter || null, limit })
+export const messagesQuery = (connId: string, opts: QueryOpts) =>
+  invoke<MsgPage>("messages_query", { connId, opts })
 export const messagesClear = (connId: string) => invoke<void>("messages_clear", { connId })
-export const topicTree = (connId: string) => invoke<TreeNode[]>("topic_tree", { connId })
+export const messagesClearTopic = (connId: string, topicFilter: string) =>
+  invoke<void>("messages_clear_topic", { connId, topicFilter })
+export const topicTree = (connId: string, format: Format) => invoke<TreeNode[]>("topic_tree", { connId, format })
 export const chartRate = (connId: string, bucketMs: number, buckets: number) =>
   invoke<RatePoint[]>("chart_rate", { connId, bucketMs, buckets })
+export const chartTraffic = (connId: string, bucketMs: number, buckets: number) =>
+  invoke<TrafficPoint[]>("chart_traffic", { connId, bucketMs, buckets })
+export const chartLoad = (connId: string, topicFilter: string, method: LoadMethod, bucketMs: number, buckets: number) =>
+  invoke<ContentPoint[]>("chart_load", { connId, topicFilter, method, bucketMs, buckets })
 export const chartContent = (connId: string, topicFilter: string, jsonpath: string, limit = 200) =>
   invoke<ContentPoint[]>("chart_content", { connId, topicFilter, jsonpath, limit })
 export type ExportKind = "csv" | "json" | "txt"

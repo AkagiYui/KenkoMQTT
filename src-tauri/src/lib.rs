@@ -109,8 +109,8 @@ async fn mqtt_publish(
 // ---- 消息库 / 计算（后端） ----
 
 #[tauri::command]
-fn messages_query(mgr: State<'_, Manager>, conn_id: String, format: codec::Format, filter: Option<String>, limit: Option<usize>) -> Vec<mqtt::MsgRow> {
-    mgr.query(&conn_id, format, filter, limit.unwrap_or(500))
+fn messages_query(mgr: State<'_, Manager>, conn_id: String, opts: mqtt::QueryOpts) -> mqtt::MsgPage {
+    mgr.query(&conn_id, &opts)
 }
 
 #[tauri::command]
@@ -119,13 +119,28 @@ fn messages_clear(mgr: State<'_, Manager>, conn_id: String) {
 }
 
 #[tauri::command]
-fn topic_tree(mgr: State<'_, Manager>, conn_id: String) -> Vec<mqtt::TreeNode> {
-    mgr.topic_tree(&conn_id)
+fn messages_clear_topic(mgr: State<'_, Manager>, conn_id: String, topic_filter: String) {
+    mgr.clear_topic(&conn_id, &topic_filter)
+}
+
+#[tauri::command]
+fn topic_tree(mgr: State<'_, Manager>, conn_id: String, format: codec::Format) -> Vec<mqtt::TreeNode> {
+    mgr.topic_tree(&conn_id, format)
 }
 
 #[tauri::command]
 fn chart_rate(mgr: State<'_, Manager>, conn_id: String, bucket_ms: u64, buckets: usize) -> Vec<mqtt::RatePoint> {
     mgr.chart_rate(&conn_id, bucket_ms, buckets)
+}
+
+#[tauri::command]
+fn chart_traffic(mgr: State<'_, Manager>, conn_id: String, bucket_ms: u64, buckets: usize) -> Vec<mqtt::TrafficPoint> {
+    mgr.chart_traffic(&conn_id, bucket_ms, buckets)
+}
+
+#[tauri::command]
+fn chart_load(mgr: State<'_, Manager>, conn_id: String, topic_filter: String, method: String, bucket_ms: u64, buckets: usize) -> Vec<mqtt::ContentPoint> {
+    mgr.chart_load(&conn_id, &topic_filter, &method, bucket_ms, buckets)
 }
 
 #[tauri::command]
@@ -224,8 +239,11 @@ pub fn run() {
             mqtt_publish,
             messages_query,
             messages_clear,
+            messages_clear_topic,
             topic_tree,
             chart_rate,
+            chart_traffic,
+            chart_load,
             chart_content,
             export_messages,
             schedule_start,

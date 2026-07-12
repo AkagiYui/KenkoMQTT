@@ -1770,6 +1770,7 @@ dependencies = [
  "jni",
  "ndk-context",
  "quick-xml 0.37.5",
+ "regex",
  "rmp-serde",
  "rumqttc",
  "rust_xlsxwriter",
