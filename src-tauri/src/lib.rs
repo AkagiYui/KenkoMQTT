@@ -11,7 +11,16 @@ use android::{check_android_permissions, open_android_settings, platform_info};
 use broker::{BrokerConfig, BrokerState};
 use model::Profile;
 use mqtt::Manager;
-use tauri::{AppHandle, Manager as _, State};
+use std::sync::Arc;
+use tauri::{AppHandle, Emitter, Manager as _, State};
+
+/// 把 Tauri 的 `AppHandle` 适配为 broker 的事件下沉端。
+struct AppSink(AppHandle);
+impl broker::EventSink for AppSink {
+    fn emit_json(&self, event: &str, payload: serde_json::Value) {
+        let _ = self.0.emit(event, payload);
+    }
+}
 
 // ---- 连接档案（JSON 持久化）----
 
@@ -222,12 +231,14 @@ async fn broker_start(
     config: BrokerConfig,
 ) -> Result<(), String> {
     let _ = store::save_broker(&app, &config);
-    broker::start(app.clone(), &state, config).await
+    let sink: Arc<dyn broker::EventSink> = Arc::new(AppSink(app.clone()));
+    broker::start(sink, &state, config).await
 }
 
 #[tauri::command]
 fn broker_stop(app: AppHandle, state: State<'_, BrokerState>) {
-    broker::stop(&app, &state)
+    let sink: Arc<dyn broker::EventSink> = Arc::new(AppSink(app));
+    broker::stop(&sink, &state)
 }
 
 #[tauri::command]

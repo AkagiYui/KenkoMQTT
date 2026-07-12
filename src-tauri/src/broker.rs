@@ -13,12 +13,26 @@ use rumqttc::mqttbytes::v4::{
 };
 use rumqttc::mqttbytes::{Error as MqttError, QoS};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 
 const MAX_PKT: usize = 256 * 1024;
+
+/// 事件下沉抽象：把 broker 与具体 UI 框架（Tauri）解耦，便于独立编译与集成测试。
+/// 生产侧由 Tauri 的 `AppHandle` 适配实现；测试侧用收集器 / 空实现。
+pub trait EventSink: Send + Sync + 'static {
+    fn emit_json(&self, event: &str, payload: serde_json::Value);
+}
+
+/// 便捷发射：任意可序列化负载 -> JSON -> sink。
+fn sink_emit<S: Serialize>(sink: &Option<Arc<dyn EventSink>>, event: &str, payload: S) {
+    if let Some(s) = sink {
+        if let Ok(v) = serde_json::to_value(payload) {
+            s.emit_json(event, v);
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -186,10 +200,8 @@ fn topic_matches(filter: &str, topic: &str) -> bool {
     f.len() == t.len()
 }
 
-fn emit<S: Serialize + Clone>(app: &Option<AppHandle>, event: &str, payload: S) {
-    if let Some(a) = app {
-        let _ = a.emit(event, payload);
-    }
+fn emit<S: Serialize + Clone>(sink: &Option<Arc<dyn EventSink>>, event: &str, payload: S) {
+    sink_emit(sink, event, payload);
 }
 
 pub fn is_running(state: &BrokerState) -> bool {
@@ -201,7 +213,11 @@ pub fn current_config(state: &BrokerState) -> Option<BrokerConfig> {
 }
 
 /// 启动 broker。绑定失败或已在运行返回错误。
-pub async fn start(app: AppHandle, state: &BrokerState, config: BrokerConfig) -> Result<(), String> {
+pub async fn start(
+    sink: Arc<dyn EventSink>,
+    state: &BrokerState,
+    config: BrokerConfig,
+) -> Result<(), String> {
     if is_running(state) {
         return Err("broker 已在运行".into());
     }
@@ -217,23 +233,23 @@ pub async fn start(app: AppHandle, state: &BrokerState, config: BrokerConfig) ->
 
     // accept 循环
     {
-        let app = app.clone();
+        let sink = Some(sink.clone());
         let core = core.clone();
         let counters = counters.clone();
         let mut sd = sd_rx.clone();
-        tauri::async_runtime::spawn(async move {
+        tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = sd.changed() => { if *sd.borrow() { break; } }
                     accepted = listener.accept() => {
                         let (stream, peer) = match accepted { Ok(v) => v, Err(_) => continue };
-                        let app = Some(app.clone());
+                        let sink = sink.clone();
                         let core = core.clone();
                         let counters = counters.clone();
                         let cfg = cfg.clone();
                         let sd_rx = sd.clone();
-                        tauri::async_runtime::spawn(async move {
-                            handle_conn(stream, peer.to_string(), app, core, counters, cfg, sd_rx).await;
+                        tokio::spawn(async move {
+                            handle_conn(stream, peer.to_string(), sink, core, counters, cfg, sd_rx).await;
                         });
                     }
                 }
@@ -243,11 +259,11 @@ pub async fn start(app: AppHandle, state: &BrokerState, config: BrokerConfig) ->
 
     // 统计/客户端列表 定时推送
     {
-        let app = app.clone();
+        let sink = sink.clone();
         let core = core.clone();
         let counters = counters.clone();
         let mut sd = sd_rx.clone();
-        tauri::async_runtime::spawn(async move {
+        tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = sd.changed() => { if *sd.borrow() { break; } }
@@ -260,14 +276,14 @@ pub async fn start(app: AppHandle, state: &BrokerState, config: BrokerConfig) ->
                             }).collect();
                             (rows, g.retained.len() as u64)
                         };
-                        let _ = app.emit("broker:stats", BrokerStats {
+                        sink_emit(&Some(sink.clone()), "broker:stats", BrokerStats {
                             running: true,
                             clients_connected: counters.connected.load(Ordering::Relaxed),
                             msgs_received: counters.recv.load(Ordering::Relaxed),
                             msgs_sent: counters.sent.load(Ordering::Relaxed),
                             retained,
                         });
-                        let _ = app.emit("broker:clients", rows);
+                        sink_emit(&Some(sink.clone()), "broker:clients", rows);
                     }
                 }
             }
@@ -275,21 +291,21 @@ pub async fn start(app: AppHandle, state: &BrokerState, config: BrokerConfig) ->
     }
 
     *state.running.lock().unwrap() = Some(Running { shutdown: sd_tx, config, core });
-    emit(&Some(app), "broker:status", serde_json::json!({"running": true}));
+    sink_emit(&Some(sink), "broker:status", serde_json::json!({"running": true}));
     Ok(())
 }
 
-pub fn stop(app: &AppHandle, state: &BrokerState) {
+pub fn stop(sink: &Arc<dyn EventSink>, state: &BrokerState) {
     if let Some(r) = state.running.lock().unwrap().take() {
         let _ = r.shutdown.send(true);
     }
-    let _ = app.emit("broker:status", serde_json::json!({"running": false}));
+    sink.emit_json("broker:status", serde_json::json!({"running": false}));
 }
 
 async fn handle_conn(
     stream: tokio::net::TcpStream,
     peer: String,
-    app: Option<AppHandle>,
+    app: Option<Arc<dyn EventSink>>,
     core: Arc<Mutex<Core>>,
     counters: Arc<Counters>,
     config: BrokerConfig,
@@ -299,7 +315,7 @@ async fn handle_conn(
     let (mut rd, mut wr) = stream.into_split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Out>();
 
-    let writer = tauri::async_runtime::spawn(async move {
+    let writer = tokio::spawn(async move {
         while let Some(out) = rx.recv().await {
             let mut b = BytesMut::new();
             if out.write(&mut b).is_err() {
