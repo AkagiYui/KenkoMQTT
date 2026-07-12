@@ -22,6 +22,11 @@ rumqttc = { version = "0.24", default-features = false, features = ["use-rustls"
 rustls = "0.22"
 rustls-pemfile = "2"
 webpki-roots = "0.26"
+# 内嵌 broker 的 mqtts / ws / wss 监听：服务端 TLS 与 WebSocket 适配（纯 Rust，跨平台）。
+tokio-rustls = "0.25"
+async-tungstenite = { version = "0.25", features = ["tokio-runtime"] }
+ws_stream_tungstenite = "0.13"
+tokio-util = { version = "0.7", features = ["compat"] }
 tokio = { version = "1.52.3", features = ["net", "io-util", "sync", "time", "rt", "macros"] }
 bytes = "1.12.1"
 base64 = "0.22.1"
@@ -36,6 +41,10 @@ serde_yaml_ng = "0.10"
 quick-xml = { version = "0.37", features = ["serialize"] }
 rust_xlsxwriter = "0.79"
 calamine = "0.26"
+
+[dev-dependencies]
+# broker 集成测试：自签证书用于 mqtts/wss 往返测试。
+rcgen = "0.13"
 
 [features]
 # used by `tauri dev`/`tauri build` to skip the updater etc.

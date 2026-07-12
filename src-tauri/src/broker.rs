@@ -129,6 +129,19 @@ pub struct BrokerConfig {
     pub password: String,
     #[serde(default)]
     pub max_clients: usize,
+    /// TLS(mqtts) 监听端口，0=关闭；证书/私钥为 PEM。
+    #[serde(default)]
+    pub tls_port: u16,
+    #[serde(default)]
+    pub tls_cert: String,
+    #[serde(default)]
+    pub tls_key: String,
+    /// WebSocket(ws) 监听端口，0=关闭。
+    #[serde(default)]
+    pub ws_port: u16,
+    /// 安全 WebSocket(wss) 监听端口，0=关闭；复用 tls_cert/tls_key。
+    #[serde(default)]
+    pub wss_port: u16,
 }
 fn yes() -> bool {
     true
@@ -142,8 +155,35 @@ impl Default for BrokerConfig {
             username: String::new(),
             password: String::new(),
             max_clients: 0,
+            tls_port: 0,
+            tls_cert: String::new(),
+            tls_key: String::new(),
+            ws_port: 0,
+            wss_port: 0,
         }
     }
+}
+
+/// 由 PEM 证书链与私钥构造服务端 rustls 配置（供 mqtts / wss 监听）。
+fn server_tls_config(cert_pem: &str, key_pem: &str) -> Result<Arc<rustls::ServerConfig>, String> {
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut cert_pem.as_bytes())
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("解析证书失败: {e}"))?;
+    if certs.is_empty() {
+        return Err("证书为空".into());
+    }
+    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+        .map_err(|e| format!("解析私钥失败: {e}"))?
+        .ok_or_else(|| "私钥为空".to_string())?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let cfg = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| format!("加载证书链失败: {e}"))?;
+    Ok(Arc::new(cfg))
 }
 
 #[derive(Serialize, Clone)]
@@ -756,6 +796,56 @@ pub fn current_config(state: &BrokerState) -> Option<BrokerConfig> {
     state.running.lock().unwrap().as_ref().map(|r| r.config.clone())
 }
 
+/// 各监听器共享的运行上下文。
+#[derive(Clone)]
+struct Ctx {
+    sink: Option<Arc<dyn EventSink>>,
+    core: Arc<Mutex<Core>>,
+    counters: Arc<Counters>,
+    cfg: BrokerConfig,
+}
+
+/// 把已就绪的字节流交给连接处理协程。
+fn serve<S>(ctx: &Ctx, stream: S, peer: String, sd: watch::Receiver<bool>)
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
+{
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        handle_conn(stream, peer, ctx.sink, ctx.core, ctx.counters, ctx.cfg, sd).await;
+    });
+}
+
+/// WebSocket 握手回调：若客户端请求 `mqtt` 子协议则在响应中回显（MQTT-over-WS 规范要求）。
+fn ws_mqtt_subprotocol(
+    req: &async_tungstenite::tungstenite::handshake::server::Request,
+    mut resp: async_tungstenite::tungstenite::handshake::server::Response,
+) -> Result<
+    async_tungstenite::tungstenite::handshake::server::Response,
+    async_tungstenite::tungstenite::handshake::server::ErrorResponse,
+> {
+    let wants_mqtt = req
+        .headers()
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .map_or(false, |s| s.split(',').any(|p| p.trim() == "mqtt"));
+    if wants_mqtt {
+        resp.headers_mut().insert("Sec-WebSocket-Protocol", "mqtt".parse().unwrap());
+    }
+    Ok(resp)
+}
+
+/// 将 async-tungstenite 的 WebSocket 流适配为 tokio 的 AsyncRead/AsyncWrite。
+fn ws_adapt<S>(
+    ws: async_tungstenite::WebSocketStream<async_tungstenite::tokio::TokioAdapter<S>>,
+) -> impl AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio_util::compat::FuturesAsyncReadCompatExt;
+    ws_stream_tungstenite::WsStream::new(ws).compat()
+}
+
 pub async fn start(
     sink: Arc<dyn EventSink>,
     state: &BrokerState,
@@ -769,15 +859,37 @@ pub async fn start(
         .await
         .map_err(|e| format!("监听 {addr} 失败: {e}"))?;
 
+    // 可选的 TLS 配置与附加监听端口（绑定失败即返回错误）。
+    let tls_cfg = if config.tls_port > 0 || config.wss_port > 0 {
+        Some(server_tls_config(&config.tls_cert, &config.tls_key)?)
+    } else {
+        None
+    };
+    let bind_extra = |port: u16| {
+        let host = config.host.clone();
+        async move {
+            if port == 0 {
+                Ok::<Option<TcpListener>, String>(None)
+            } else {
+                TcpListener::bind(format!("{host}:{port}"))
+                    .await
+                    .map(Some)
+                    .map_err(|e| format!("监听 {host}:{port} 失败: {e}"))
+            }
+        }
+    };
+    let tls_listener = bind_extra(config.tls_port).await?;
+    let ws_listener = bind_extra(config.ws_port).await?;
+    let wss_listener = bind_extra(config.wss_port).await?;
+
     let (sd_tx, sd_rx) = watch::channel(false);
     let core = Arc::new(Mutex::new(Core::default()));
     let counters = Arc::new(Counters::default());
-    let cfg = config.clone();
+    let ctx = Ctx { sink: Some(sink.clone()), core: core.clone(), counters: counters.clone(), cfg: config.clone() };
 
+    // TCP(明文 mqtt)
     {
-        let sink = Some(sink.clone());
-        let core = core.clone();
-        let counters = counters.clone();
+        let ctx = ctx.clone();
         let mut sd = sd_rx.clone();
         tokio::spawn(async move {
             loop {
@@ -785,13 +897,85 @@ pub async fn start(
                     _ = sd.changed() => { if *sd.borrow() { break; } }
                     accepted = listener.accept() => {
                         let (stream, peer) = match accepted { Ok(v) => v, Err(_) => continue };
-                        let sink = sink.clone();
-                        let core = core.clone();
-                        let counters = counters.clone();
-                        let cfg = cfg.clone();
-                        let sd_rx = sd.clone();
+                        let _ = stream.set_nodelay(true);
+                        serve(&ctx, stream, peer.to_string(), sd.clone());
+                    }
+                }
+            }
+        });
+    }
+
+    // TLS(mqtts)
+    if let (Some(l), Some(tcfg)) = (tls_listener, tls_cfg.clone()) {
+        let ctx = ctx.clone();
+        let mut sd = sd_rx.clone();
+        let acceptor = tokio_rustls::TlsAcceptor::from(tcfg);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = sd.changed() => { if *sd.borrow() { break; } }
+                    accepted = l.accept() => {
+                        let (tcp, peer) = match accepted { Ok(v) => v, Err(_) => continue };
+                        let _ = tcp.set_nodelay(true);
+                        let acceptor = acceptor.clone();
+                        let ctx = ctx.clone();
+                        let sd2 = sd.clone();
                         tokio::spawn(async move {
-                            handle_conn(stream, peer.to_string(), sink, core, counters, cfg, sd_rx).await;
+                            if let Ok(tls) = acceptor.accept(tcp).await {
+                                serve(&ctx, tls, peer.to_string(), sd2);
+                            }
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    // WebSocket(ws)
+    if let Some(l) = ws_listener {
+        let ctx = ctx.clone();
+        let mut sd = sd_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = sd.changed() => { if *sd.borrow() { break; } }
+                    accepted = l.accept() => {
+                        let (tcp, peer) = match accepted { Ok(v) => v, Err(_) => continue };
+                        let _ = tcp.set_nodelay(true);
+                        let ctx = ctx.clone();
+                        let sd2 = sd.clone();
+                        tokio::spawn(async move {
+                            if let Ok(ws) = async_tungstenite::tokio::accept_hdr_async(tcp, ws_mqtt_subprotocol).await {
+                                serve(&ctx, ws_adapt(ws), peer.to_string(), sd2);
+                            }
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    // 安全 WebSocket(wss)
+    if let (Some(l), Some(tcfg)) = (wss_listener, tls_cfg) {
+        let ctx = ctx.clone();
+        let mut sd = sd_rx.clone();
+        let acceptor = tokio_rustls::TlsAcceptor::from(tcfg);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = sd.changed() => { if *sd.borrow() { break; } }
+                    accepted = l.accept() => {
+                        let (tcp, peer) = match accepted { Ok(v) => v, Err(_) => continue };
+                        let _ = tcp.set_nodelay(true);
+                        let acceptor = acceptor.clone();
+                        let ctx = ctx.clone();
+                        let sd2 = sd.clone();
+                        tokio::spawn(async move {
+                            if let Ok(tls) = acceptor.accept(tcp).await {
+                                if let Ok(ws) = async_tungstenite::tokio::accept_hdr_async(tls, ws_mqtt_subprotocol).await {
+                                    serve(&ctx, ws_adapt(ws), peer.to_string(), sd2);
+                                }
+                            }
                         });
                     }
                 }
@@ -889,17 +1073,18 @@ fn peek_protocol(buf: &[u8]) -> Option<u8> {
     }
 }
 
-async fn handle_conn(
-    stream: tokio::net::TcpStream,
+async fn handle_conn<S>(
+    stream: S,
     peer: String,
     app: Option<Arc<dyn EventSink>>,
     core: Arc<Mutex<Core>>,
     counters: Arc<Counters>,
     config: BrokerConfig,
     mut shutdown: watch::Receiver<bool>,
-) {
-    let _ = stream.set_nodelay(true);
-    let (mut rd, mut wr) = stream.into_split();
+) where
+    S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
+{
+    let (mut rd, mut wr) = tokio::io::split(stream);
     let (tx, mut rx) = mpsc::channel::<Out>(OUT_CAP);
 
     let proto = Arc::new(AtomicU8::new(PROTO_V4));
@@ -1345,6 +1530,47 @@ mod tests {
         assert_eq!(peek_protocol(&[0x10]), None);
     }
 
+    struct NoopSink;
+    impl EventSink for NoopSink {
+        fn emit_json(&self, _: &str, _: serde_json::Value) {}
+    }
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+    async fn start_cfg(cfg: BrokerConfig) {
+        let state: &'static BrokerState = Box::leak(Box::new(BrokerState::default()));
+        start(Arc::new(NoopSink), state, cfg).await.unwrap();
+    }
+    // 跳过校验的客户端 rustls 配置（仅测试自签证书）。
+    fn skip_verify_client() -> rustls::ClientConfig {
+        use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+        use rustls::{DigitallySignedStruct, SignatureScheme};
+        #[derive(Debug)]
+        struct NV;
+        impl ServerCertVerifier for NV {
+            fn verify_server_cert(&self, _: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: &ServerName<'_>, _: &[u8], _: UnixTime) -> Result<ServerCertVerified, rustls::Error> {
+                Ok(ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(&self, _: &[u8], _: &CertificateDer<'_>, _: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn verify_tls13_signature(&self, _: &[u8], _: &CertificateDer<'_>, _: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+            }
+        }
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NV))
+            .with_no_client_auth()
+    }
+
     fn spawn_broker(cfg: BrokerConfig) -> u16 {
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         std_listener.set_nonblocking(true).unwrap();
@@ -1586,5 +1812,74 @@ mod tests {
             }
         }
         panic!("跨协议投递失败");
+    }
+
+    // P2: TLS(mqtts) 监听 —— 自签证书 + 跳过校验客户端往返。
+    #[tokio::test]
+    async fn test_tls_listener() {
+        use rumqttc::{AsyncClient, Event, MqttOptions, Packet as CPacket, QoS, TlsConfiguration, Transport};
+        let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let port = free_port();
+        let tls_port = free_port();
+        let cfg = BrokerConfig {
+            host: "127.0.0.1".into(),
+            port,
+            tls_port,
+            tls_cert: ck.cert.pem(),
+            tls_key: ck.key_pair.serialize_pem(),
+            ..Default::default()
+        };
+        start_cfg(cfg).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut mo = MqttOptions::new("tlsc", "127.0.0.1", tls_port);
+        mo.set_keep_alive(Duration::from_secs(5));
+        mo.set_transport(Transport::Tls(TlsConfiguration::Rustls(Arc::new(skip_verify_client()))));
+        let (client, mut el) = AsyncClient::new(mo, 10);
+        client.subscribe("tls/#", QoS::AtLeastOnce).await.unwrap();
+        for _ in 0..80 {
+            match el.poll().await.unwrap() {
+                Event::Incoming(CPacket::SubAck(_)) => {
+                    client.publish("tls/x", QoS::AtLeastOnce, false, b"secure".to_vec()).await.unwrap();
+                }
+                Event::Incoming(CPacket::Publish(p)) => {
+                    assert_eq!(&p.payload[..], b"secure");
+                    return;
+                }
+                _ => {}
+            }
+        }
+        panic!("TLS 监听往返失败");
+    }
+
+    // P2: WebSocket(ws) 监听往返。
+    #[tokio::test]
+    async fn test_ws_listener() {
+        use rumqttc::{AsyncClient, Event, MqttOptions, Packet as CPacket, QoS, Transport};
+        let port = free_port();
+        let ws_port = free_port();
+        let cfg = BrokerConfig { host: "127.0.0.1".into(), port, ws_port, ..Default::default() };
+        start_cfg(cfg).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let url = format!("ws://127.0.0.1:{ws_port}/mqtt");
+        let mut mo = MqttOptions::new("wsc", url, ws_port);
+        mo.set_keep_alive(Duration::from_secs(5));
+        mo.set_transport(Transport::Ws);
+        let (client, mut el) = AsyncClient::new(mo, 10);
+        client.subscribe("ws/#", QoS::AtLeastOnce).await.unwrap();
+        for _ in 0..80 {
+            match el.poll().await.unwrap() {
+                Event::Incoming(CPacket::SubAck(_)) => {
+                    client.publish("ws/x", QoS::AtLeastOnce, false, b"overws".to_vec()).await.unwrap();
+                }
+                Event::Incoming(CPacket::Publish(p)) => {
+                    assert_eq!(&p.payload[..], b"overws");
+                    return;
+                }
+                _ => {}
+            }
+        }
+        panic!("WS 监听往返失败");
     }
 }
