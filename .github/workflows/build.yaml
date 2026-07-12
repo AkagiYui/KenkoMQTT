@@ -182,12 +182,17 @@ jobs:
           BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
           OUT="$RUNNER_TEMP/apks"; mkdir -p "$OUT"
           for apk in "$RUNNER_TEMP"/unsigned/*.apk; do
-            # app-universal-release-unsigned.apk -> universal；app-arm64-v8a-release-unsigned.apk -> arm64-v8a
-            abi="$(basename "$apk" | sed -E 's/^app-(.*)-release-unsigned\.apk$/\1/')"
+            # Tauri 的 split 目标名(arm/arm64/x86/x86_64/universal) → Android ABI 名
+            raw="$(basename "$apk" | sed -E 's/^app-(.*)-release-unsigned\.apk$/\1/')"
+            case "$raw" in
+              arm)   abi=armeabi-v7a ;;
+              arm64) abi=arm64-v8a ;;
+              *)     abi="$raw" ;;
+            esac
             "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --ks-key-alias ci \
               --key-pass pass:android --out "$OUT/kenkomqtt-$abi.apk" "$apk"
             "$BT/apksigner" verify "$OUT/kenkomqtt-$abi.apk"
-            echo "已签名: $abi"
+            echo "已签名: $raw -> $abi"
           done
           ls -lh "$OUT"
 
