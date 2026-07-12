@@ -454,6 +454,7 @@ struct ConnectIn {
     has_login: bool,
     will: Option<(Msg, u32)>, // (遗嘱消息, 延迟秒)
     session_expiry: Option<u32>,
+    receive_maximum: Option<u16>, // v5 客户端流控上限
 }
 enum In {
     Connect(Box<ConnectIn>),
@@ -502,6 +503,7 @@ fn read_in_v4(buf: &mut BytesMut) -> Result<Option<In>, ()> {
                     has_login: has,
                     will,
                     session_expiry: None,
+                    receive_maximum: None,
                 }))
             }
             Packet::Publish(p) => In::Publish(
@@ -573,6 +575,7 @@ fn read_in_v5(buf: &mut BytesMut) -> Result<Option<In>, ()> {
                     (m, delay)
                 });
                 let session_expiry = c.properties.as_ref().and_then(|p| p.session_expiry_interval);
+                let receive_maximum = c.properties.as_ref().and_then(|p| p.receive_maximum);
                 In::Connect(Box::new(ConnectIn {
                     client_id: c.client_id.clone(),
                     clean: c.clean_start,
@@ -582,6 +585,7 @@ fn read_in_v5(buf: &mut BytesMut) -> Result<Option<In>, ()> {
                     has_login: has,
                     will,
                     session_expiry,
+                    receive_maximum,
                 }))
             }
             Packet::Publish(p) => {
@@ -683,6 +687,8 @@ struct Session {
     queue: VecDeque<Msg>,
     incoming_qos2: HashMap<u16, Msg>,
     will: Option<(Msg, u32)>,
+    /// 客户端流控上限（v5 Receive Maximum）；None=不限。
+    recv_max: Option<u16>,
 }
 impl Session {
     fn new(addr: String, username: String, proto: u8, clean: bool) -> Self {
@@ -700,7 +706,16 @@ impl Session {
             queue: VecDeque::new(),
             incoming_qos2: HashMap::new(),
             will: None,
+            recv_max: None,
         }
+    }
+    /// 断开后是否保留会话：clean=0 或 v5 会话过期>0。
+    fn persistent(&self) -> bool {
+        !self.clean || self.session_expiry.map_or(false, |e| e > 0)
+    }
+    /// 当前是否还允许再发一条未确认消息（遵守客户端 Receive Maximum）。
+    fn has_inflight_room(&self) -> bool {
+        self.recv_max.map_or(true, |rm| self.inflight.len() < rm as usize)
     }
     fn alloc_pkid(&mut self) -> u16 {
         for _ in 0..=u16::MAX {
@@ -714,6 +729,15 @@ impl Session {
         }
         self.next_pkid
     }
+    fn enqueue(&mut self, mut m: Msg, eff: QoS) {
+        m.qos = eff;
+        m.pkid = 0;
+        m.dup = false;
+        if self.queue.len() >= MAX_QUEUE {
+            self.queue.pop_front();
+        }
+        self.queue.push_back(m);
+    }
     /// 投递一条已按订阅降级/加属性的消息。返回实际在线发送数(用于统计)。
     fn deliver(&mut self, mut m: Msg, eff: QoS) -> u64 {
         m.qos = eff;
@@ -723,27 +747,52 @@ impl Session {
             if let Some(c) = &self.online {
                 return c.tx.try_send(Out::Publish(m)).is_ok() as u64;
             }
-            return 0;
+            return 0; // 离线 QoS0 丢弃
         }
+        // QoS>=1
         if self.online.is_some() {
+            if !self.has_inflight_room() {
+                // 达到客户端流控上限：入队，待收到 ACK 后再发。
+                self.enqueue(m, eff);
+                return 0;
+            }
             let pkid = self.alloc_pkid();
             m.pkid = pkid;
-            let sent = self
+            let ok = self
                 .online
                 .as_ref()
                 .map(|c| c.tx.try_send(Out::Publish(m.clone())).is_ok())
                 .unwrap_or(false);
             self.inflight.insert(pkid, Inflight { msg: m, phase: Phase::AwaitAck });
-            sent as u64
-        } else if !self.clean {
-            if self.queue.len() >= MAX_QUEUE {
-                self.queue.pop_front();
+            if !ok {
+                // 出站队列拥塞：踢掉慢连接以重置背压（inflight 在持久会话下重连补发）。
+                if let Some(c) = &self.online {
+                    c.kick.notify_one();
+                }
             }
-            self.queue.push_back(m);
+            ok as u64
+        } else if self.persistent() {
+            self.enqueue(m, eff);
             0
         } else {
-            0
+            0 // 离线且非持久会话：丢弃
         }
+    }
+    /// 收到 ACK 释放 inflight 后，尽量把离线/流控队列补发出去（在线时）。
+    fn flush_online(&mut self) -> Vec<Out> {
+        let mut outs = vec![];
+        if self.online.is_none() {
+            return outs;
+        }
+        while self.has_inflight_room() {
+            let Some(mut m) = self.queue.pop_front() else { break };
+            let pkid = self.alloc_pkid();
+            m.pkid = pkid;
+            m.dup = false;
+            outs.push(Out::Publish(m.clone()));
+            self.inflight.insert(pkid, Inflight { msg: m, phase: Phase::AwaitAck });
+        }
+        outs
     }
     fn resume_outbound(&mut self) -> Vec<Out> {
         let mut outs = vec![];
@@ -757,8 +806,9 @@ impl Session {
                 Phase::AwaitComp => outs.push(Out::PubRel(*pkid)),
             }
         }
-        let queued: Vec<Msg> = self.queue.drain(..).collect();
-        for mut m in queued {
+        // 队列补发，遵守 Receive Maximum；余量留待 ACK 后 flush。
+        while self.has_inflight_room() {
+            let Some(mut m) = self.queue.pop_front() else { break };
             let pkid = self.alloc_pkid();
             m.pkid = pkid;
             m.dup = false;
@@ -1236,7 +1286,8 @@ async fn handle_conn<S>(
                                     || (c.has_login && c.username == config.username && c.password == config.password)
                             };
                             let assigned = c.client_id.is_empty();
-                            let cid = if assigned { format!("auto-{}", now_ms()) } else { c.client_id.clone() };
+                            // 唯一自动 client_id（用 conn_id 避免同毫秒碰撞）。
+                            let cid = if assigned { format!("auto-{conn_id}") } else { c.client_id.clone() };
                             let full = {
                                 let g = core.lock().unwrap();
                                 config.max_clients > 0 && !g.sessions.contains_key(&cid)
@@ -1248,24 +1299,24 @@ async fn handle_conn<S>(
                                 break 'conn;
                             }
                             client_id = cid;
-                            // 持久性：v4 clean=false，或 v5 session_expiry>0。
-                            let persistent = !c.clean || c.session_expiry.map_or(false, |e| e > 0);
                             let (session_present, resend, old_kick) = {
                                 let mut g = core.lock().unwrap();
                                 // 先摘取旧连接的踢出句柄（无论是否续会话都要踢掉旧连接）。
                                 let old_kick = g.sessions.get_mut(&client_id)
                                     .and_then(|s| s.online.take()).map(|c| c.kick);
-                                let resumable = persistent && g.sessions.contains_key(&client_id);
-                                if !persistent {
+                                // 规范：是否续会话仅由 clean 标志决定；clean=1 必须丢弃旧会话且 session_present=0。
+                                let resumable = !c.clean && g.sessions.contains_key(&client_id);
+                                if c.clean {
                                     g.sessions.remove(&client_id);
                                 }
                                 let sess = g.sessions.entry(client_id.clone())
-                                    .or_insert_with(|| Session::new(peer.clone(), c.username.clone(), my_proto, !persistent));
+                                    .or_insert_with(|| Session::new(peer.clone(), c.username.clone(), my_proto, c.clean));
                                 sess.addr = peer.clone();
                                 sess.username = c.username.clone();
                                 sess.proto = my_proto;
-                                sess.clean = !persistent;
+                                sess.clean = c.clean;
                                 sess.session_expiry = c.session_expiry;
+                                sess.recv_max = c.receive_maximum;
                                 sess.expires_at = None;
                                 sess.will = c.will.clone();
                                 sess.online = Some(Conn { tx: tx.clone(), conn_id, kick: kick.clone() });
@@ -1475,8 +1526,14 @@ async fn handle_conn<S>(
                             let _ = tx.send(Out::PubComp(pkid)).await;
                         }
                         In::PubAck(pkid) if connected => {
-                            let mut g = core.lock().unwrap();
-                            if let Some(s) = g.sessions.get_mut(&client_id) { s.inflight.remove(&pkid); }
+                            let outs = {
+                                let mut g = core.lock().unwrap();
+                                match g.sessions.get_mut(&client_id) {
+                                    Some(s) => { s.inflight.remove(&pkid); s.flush_online() }
+                                    None => vec![],
+                                }
+                            };
+                            for o in outs { let _ = tx.send(o).await; }
                         }
                         In::PubRec(pkid) if connected => {
                             {
@@ -1488,8 +1545,14 @@ async fn handle_conn<S>(
                             let _ = tx.send(Out::PubRel(pkid)).await;
                         }
                         In::PubComp(pkid) if connected => {
-                            let mut g = core.lock().unwrap();
-                            if let Some(s) = g.sessions.get_mut(&client_id) { s.inflight.remove(&pkid); }
+                            let outs = {
+                                let mut g = core.lock().unwrap();
+                                match g.sessions.get_mut(&client_id) {
+                                    Some(s) => { s.inflight.remove(&pkid); s.flush_online() }
+                                    None => vec![],
+                                }
+                            };
+                            for o in outs { let _ = tx.send(o).await; }
                         }
                         In::PingReq => { let _ = tx.send(Out::PingResp).await; }
                         In::Disconnect => { clean_disconnect = true; break 'conn; }
@@ -1512,7 +1575,7 @@ async fn handle_conn<S>(
                 let sess = g.sessions.get_mut(&client_id).unwrap();
                 sess.online = None;
                 let will = if clean_disconnect || kicked { sess.will = None; None } else { sess.will.take() };
-                if sess.clean {
+                if !sess.persistent() {
                     g.sessions.remove(&client_id);
                 } else if let Some(exp) = sess.session_expiry {
                     // v5 会话过期倒计时（0xFFFFFFFF 视为永不过期）。
@@ -1745,6 +1808,39 @@ mod tests {
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NV))
             .with_no_client_auth()
+    }
+
+    // 会话持久性语义：clean 决定连接时是否续会话，session_expiry 决定断开后是否保留。
+    #[test]
+    fn test_persistent_semantics() {
+        let mut s = Session::new("".into(), "".into(), PROTO_V4, true); // clean
+        assert!(!s.persistent());
+        s.session_expiry = Some(60); // clean_start=1 但 expiry>0：断开后仍保留
+        assert!(s.persistent());
+        let s2 = Session::new("".into(), "".into(), PROTO_V4, false);
+        assert!(s2.persistent());
+    }
+
+    // Receive Maximum 流控：超过上限的消息入队，ACK 后再补发。
+    #[tokio::test]
+    async fn test_receive_maximum_flow_control() {
+        let (tx, mut rx) = mpsc::channel::<Out>(16);
+        let mut s = Session::new("a".into(), "".into(), PROTO_V5, false);
+        s.recv_max = Some(1);
+        s.online = Some(Conn { tx, conn_id: 1, kick: Arc::new(Notify::new()) });
+        let mk = |p: &[u8]| Msg::simple("t".into(), QoS::AtLeastOnce, false, Bytes::from(p.to_vec()));
+        s.deliver(mk(b"1"), QoS::AtLeastOnce);
+        s.deliver(mk(b"2"), QoS::AtLeastOnce);
+        assert_eq!(s.inflight.len(), 1, "上限=1 只允许一条 inflight");
+        assert_eq!(s.queue.len(), 1, "第二条应被流控入队");
+        let pkid = match rx.try_recv().unwrap() { Out::Publish(p) => p.pkid, _ => panic!("应为 Publish") };
+        assert!(rx.try_recv().is_err(), "第二条不应发出");
+        // ACK 第一条 -> 补发第二条
+        s.inflight.remove(&pkid);
+        let outs = s.flush_online();
+        assert_eq!(outs.len(), 1);
+        assert_eq!(s.queue.len(), 0);
+        assert_eq!(s.inflight.len(), 1);
     }
 
     fn spawn_broker(cfg: BrokerConfig) -> u16 {
